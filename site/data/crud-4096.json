@@ -78,6 +78,26 @@
     "status_5xx": 0
   },
   {
+    "framework": "pyronova",
+    "language": "Python",
+    "rps": 12432,
+    "avg_latency": "325.56ms",
+    "p99_latency": "335.30ms",
+    "cpu": "293.1%",
+    "memory": "1.3GiB",
+    "connections": 4096,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "4.49MB/s",
+    "input_bw": "1.07MB/s",
+    "reconnects": 0,
+    "status_2xx": 186484,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "ring-http-exchange",
     "language": "Clojure",
     "rps": 323609,

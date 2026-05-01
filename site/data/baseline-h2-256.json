@@ -297,21 +297,21 @@
   {
     "framework": "pyronova",
     "language": "Python",
-    "rps": 301446,
-    "avg_latency": "40.59ms",
-    "p99_latency": "40.59ms",
-    "cpu": "2435.7%",
+    "rps": 2584384,
+    "avg_latency": "10.04ms",
+    "p99_latency": "10.04ms",
+    "cpu": "3161.5%",
     "memory": "1.3GiB",
     "connections": 256,
     "threads": 64,
     "duration": "5s",
     "pipeline": 1,
-    "bandwidth": "25.31MB/s",
+    "bandwidth": "67.09MB/s",
     "reconnects": 0,
-    "status_2xx": 1516276,
+    "status_2xx": 13025300,
     "status_3xx": 0,
     "status_4xx": 0,
-    "status_5xx": 1609166
+    "status_5xx": 0
   },
   {
     "framework": "quarkus-jvm",

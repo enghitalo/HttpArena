@@ -183,7 +183,7 @@ fi
 
 # Start the postgres sidecar if any subscribed test needs it.
 need_pg=false
-for t in async-db crud api-4 api-16 gateway-64 gateway-h3 production-stack; do
+for t in async-db crud api-4 api-16 gateway-64 gateway-h3 production-stack fortunes; do
     if framework_subscribes_to "$t"; then need_pg=true; break; fi
 done
 $need_pg && postgres_start

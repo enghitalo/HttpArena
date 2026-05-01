@@ -89,7 +89,7 @@ fi
 HARD_NOFILE=$(ulimit -Hn 2>/dev/null || echo 1048576)
 # Docker --ulimit nofile rejects "unlimited"; fall back to a large numeric cap
 [[ "$HARD_NOFILE" =~ ^[0-9]+$ ]] || HARD_NOFILE=1048576
-if has_test "async-db" || has_test "crud" || has_test "api-4" || has_test "api-16" || has_test "gateway-64" || has_test "gateway-h3" || has_test "production-stack"; then
+if has_test "async-db" || has_test "crud" || has_test "api-4" || has_test "api-16" || has_test "gateway-64" || has_test "gateway-h3" || has_test "production-stack" || has_test "fortunes"; then
     docker_args=(-d --name "$CONTAINER_NAME" --network host --security-opt seccomp=unconfined
         --ulimit memlock=-1:-1 --ulimit nofile="$HARD_NOFILE:$HARD_NOFILE")
 else
@@ -138,7 +138,7 @@ if [ "$ENGINE" = "io_uring" ]; then
 fi
 
 # Start Postgres sidecar if async-db is needed
-if has_test "async-db" || has_test "crud" || has_test "api-4" || has_test "api-16" || has_test "gateway-64" || has_test "gateway-h3" || has_test "production-stack"; then
+if has_test "async-db" || has_test "crud" || has_test "api-4" || has_test "api-16" || has_test "gateway-64" || has_test "gateway-h3" || has_test "production-stack" || has_test "fortunes"; then
     echo "[postgres] Starting Postgres sidecar for validation..."
     docker rm -f "$PG_CONTAINER" 2>/dev/null || true
     docker run -d --name "$PG_CONTAINER" --network host \
@@ -1022,6 +1022,73 @@ print(f'{count} {has_rating} {has_tags} {has_active_bool}')
         PASS=$((PASS + 1))
     else
         fail_with_link "[GET /async-db empty range]: expected count=0, got $pgdb_empty" "$ASYNCDB_DOCS"
+    fi
+fi
+
+# ───── Fortunes (GET /fortunes) — template-engine benchmark ─────
+#
+# Feature-based validation, not byte-exact. Engines disagree on whitespace
+# and attribute formatting; what matters is that the rendered HTML actually
+# loops the DB rows, includes the runtime-injected row, escapes user
+# content, and is sized like a real page (not stripped to win the bench).
+
+if has_test "fortunes"; then
+    FORTUNES_DOCS="$DOCS_BASE/h1/isolated/fortunes/validation"
+    echo "[test] fortunes endpoint"
+
+    body=$(curl -s --max-time 30 "http://localhost:$PORT/fortunes" || true)
+
+    check_header "GET /fortunes Content-Type" "Content-Type" "text/html" "$FORTUNES_DOCS" \
+        "http://localhost:$PORT/fortunes"
+
+    if echo "$body" | grep -qi '<!doctype html>'; then
+        echo "  PASS [GET /fortunes <!DOCTYPE html>]"
+        PASS=$((PASS + 1))
+    else
+        fail_with_link "[GET /fortunes <!DOCTYPE html>]: missing — layout/partial likely not rendered" "$FORTUNES_DOCS"
+    fi
+
+    # Each row in the rendered table must produce a <tr>. 201 data rows are
+    # required (200 seeded + 1 runtime-injected); a header row is allowed
+    # but not required, so the band is 201–210 to absorb implementation-
+    # specific extras (footer rows, etc.).
+    tr_count=$(echo "$body" | grep -oi '<tr' | wc -l)
+    if [ "$tr_count" -ge 201 ] && [ "$tr_count" -le 210 ]; then
+        echo "  PASS [GET /fortunes <tr> count=$tr_count]"
+        PASS=$((PASS + 1))
+    else
+        fail_with_link "[GET /fortunes <tr> count]: expected 201–210, got $tr_count" "$FORTUNES_DOCS"
+    fi
+
+    # Runtime-injected row text — proves the handler appended id=0 in memory
+    # rather than caching a pre-rendered page from the DB rows alone.
+    if echo "$body" | grep -qF 'Additional fortune added at request time.'; then
+        echo "  PASS [GET /fortunes runtime-injected row]"
+        PASS=$((PASS + 1))
+    else
+        fail_with_link "[GET /fortunes runtime-injected row]: missing 'Additional fortune added at request time.'" "$FORTUNES_DOCS"
+    fi
+
+    # XSS escape — load-bearing check. Row 11 contains a raw <script> tag
+    # in the DB; the rendered output must encode it as &lt;script&gt; and
+    # must NOT contain the raw <script>alert sequence anywhere.
+    if echo "$body" | grep -qF '&lt;script&gt;' && ! echo "$body" | grep -qF '<script>alert'; then
+        echo "  PASS [GET /fortunes XSS escape]"
+        PASS=$((PASS + 1))
+    else
+        fail_with_link "[GET /fortunes XSS escape]: <script> in row 11 not properly HTML-escaped" "$FORTUNES_DOCS"
+    fi
+
+    # Size sanity — catches stripped pages and empty bodies. A 201-row
+    # table plus a layout typically lands between 18 KB and 40 KB; the band
+    # is generous to absorb whitespace and per-engine formatting, but
+    # rejects empty / fragment / pathologically-large outputs.
+    size=${#body}
+    if [ "$size" -ge 18432 ] && [ "$size" -le 65536 ]; then
+        echo "  PASS [GET /fortunes body size=${size}B]"
+        PASS=$((PASS + 1))
+    else
+        fail_with_link "[GET /fortunes body size]: expected 18432–65536 bytes, got $size" "$FORTUNES_DOCS"
     fi
 fi
 
