@@ -66,6 +66,7 @@
             "options": {
                 "listeners": [
                     {"host": "0.0.0.0", "port": 8080, "tls": false},
+                    {"host": "0.0.0.0", "port": 8081, "tls": true, "protocol": "http1"},
                     {"host": "0.0.0.0", "port": 8443, "tls": true, "protocol": "auto"}
                 ],
                 "static_handlers": [
