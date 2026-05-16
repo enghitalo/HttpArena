@@ -20,5 +20,8 @@ RUN wget -q -O /tmp/typev.zip \
 # source in benchmark-code/src/main.tc. The S3 zip ships the VM only.
 COPY bundle/output.tvbc /app/output.tvbc
 
+# Fixes number of threads to 64, ignoring sysconf(NPROCESSORS)
+ENV TV_WORKERS=64
+
 EXPOSE 8080
 CMD ["/app/typev", "/app/output.tvbc"]
