@@ -54,6 +54,41 @@ local fn fieldInt(data: byte[], start: uint, end: uint, key: byte[]) -> int {
     return 0
 }
 
+// Strip insignificant (out-of-string) whitespace from data[start..end) and
+// return the compacted bytes. 
+local fn compactItem(data: byte[], start: uint, end: uint) -> byte[] {
+    let out: byte[] = new byte[](end - start)
+    let w: uint = 0u
+    let inStr: bool = false
+    let escaped: bool = false
+    foreach p: uint in start, end {
+        let c: int = data[p] as int
+        if inStr {
+            out[w] = data[p]
+            w = w + 1u
+            if escaped {
+                // this byte was escaped by a preceding backslash — consume it
+                escaped = false
+            } else if c == 92 {
+                escaped = true
+            } else if c == 34 {
+                inStr = false
+            }
+        } else {
+            if c == 34 {
+                inStr = true
+                out[w] = data[p]
+                w = w + 1u
+            } else if c != 32 && c != 10 && c != 13 && c != 9 {
+                out[w] = data[p]
+                w = w + 1u
+            }
+        }
+    }
+    out.resize(w)
+    return out
+}
+
 // Read the dataset file and split the top-level JSON array into its objects.
 fn loadDataset(path: string) -> Dataset {
     let ds: Dataset = {prefixes: [], prices: [], quantities: [], n: 0}
@@ -114,8 +149,8 @@ fn loadDataset(path: string) -> Dataset {
             }
         }
         let itemEnd: uint = p
-        // prefix = item minus the trailing '}'
-        ds.prefixes.push(data.slice(itemStart, itemEnd - 1u))
+        // prefix = item minus the trailing '}', whitespace-compacted
+        ds.prefixes.push(compactItem(data, itemStart, itemEnd - 1u))
         ds.prices.push(fieldInt(data, itemStart, itemEnd, priceKey))
         ds.quantities.push(fieldInt(data, itemStart, itemEnd, qtyKey))
         count = count + 1
