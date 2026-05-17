@@ -17,5 +17,24 @@
     "status_3xx": 0,
     "status_4xx": 0,
     "status_5xx": 0
+  },
+  {
+    "framework": "ring-http-exchange",
+    "language": "Clojure",
+    "rps": 66355,
+    "avg_latency": "15.39ms",
+    "p99_latency": "25.20ms",
+    "cpu": "6388.7%",
+    "memory": "14.1GiB",
+    "connections": 1024,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "1.60GB/s",
+    "reconnects": 0,
+    "status_2xx": 331778,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
   }
 ]
