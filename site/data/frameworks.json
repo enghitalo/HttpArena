@@ -413,6 +413,13 @@
       }
     ]
   },
+  "rack-iodine": {
+    "dir": "rack-iodine",
+    "description": "Iodine is a fast concurrent web application for Ruby",
+    "repo": "https://github.com/boazsegev/iodine",
+    "type": "engine",
+    "engine": "iodine"
+  },
   "rage": {
     "dir": "rage",
     "description": "Rage is a modern Ruby framework designed for non-blocking I/O and simpler infrastructure",

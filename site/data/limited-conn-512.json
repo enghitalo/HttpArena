@@ -807,6 +807,26 @@
     "status_5xx": 0
   },
   {
+    "framework": "rack-iodine",
+    "language": "Ruby",
+    "rps": 59328,
+    "avg_latency": "8.61ms",
+    "p99_latency": "58.20ms",
+    "cpu": "4722.5%",
+    "memory": "5.7GiB",
+    "connections": 512,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "6.96MB/s",
+    "input_bw": "4.58MB/s",
+    "reconnects": 29542,
+    "status_2xx": 296642,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "rage",
     "language": "Ruby",
     "rps": 54318,
