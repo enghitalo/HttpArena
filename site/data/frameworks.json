@@ -597,6 +597,13 @@
     "type": "production",
     "engine": "trillium-http"
   },
+  "true-async-server": {
+    "dir": "true-async-server",
+    "description": "Native PHP HTTP server built on the TrueAsync coroutine engine. Each connection runs as a cooperative coroutine; one OS thread per CPU listens via SO_REUSEPORT inside a single PHP process. PDO connection pool, OPcache JIT, no Caddy / FrankenPHP / FastCGI in front.",
+    "repo": "https://github.com/true-async/server",
+    "type": "tuned",
+    "engine": "true-async-server"
+  },
   "typev": {
     "dir": "typev",
     "description": "TypeV bytecode VM running a Type-C HTTP server.",

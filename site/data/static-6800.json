@@ -1022,6 +1022,25 @@
     "status_5xx": 0
   },
   {
+    "framework": "true-async-server",
+    "language": "PHP",
+    "rps": 600404,
+    "avg_latency": "61.42ms",
+    "p99_latency": "61.42ms",
+    "cpu": "3212.9%",
+    "memory": "318MiB",
+    "connections": 6800,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "9.16GB",
+    "reconnects": 0,
+    "status_2xx": 3062368,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "typev",
     "language": "Type-C",
     "rps": 1072338,

@@ -95,6 +95,25 @@
     "status_5xx": 0
   },
   {
+    "framework": "true-async-server",
+    "language": "PHP",
+    "rps": 4006305,
+    "avg_latency": "24.02ms",
+    "p99_latency": "24.02ms",
+    "cpu": "7256.2%",
+    "memory": "479MiB",
+    "connections": 1024,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "84.92MB/s",
+    "reconnects": 0,
+    "status_2xx": 20231845,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "wtx",
     "language": "Rust",
     "rps": 651217,
