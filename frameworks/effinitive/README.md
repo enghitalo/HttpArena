@@ -5,31 +5,33 @@ Ultra-high-performance custom HTTP server for .NET 10 — built from scratch for
 ## Stack
 
 - **Language:** C# / .NET 10
-- **Framework:** Effinitive (custom, no Kestrel)
-- **Engine:** Custom TCP server with System.IO.Pipelines
-- **Build:** Self-contained single-file publish
+- **Framework:** Effinitive
+- **Engine:** Effinitive
+- **Build:** Framework-dependent publish, `mcr.microsoft.com/dotnet/runtime:10.0` runtime with `libmsquic` installed for HTTP/3
 
 ## Endpoints
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
+|---|---|---|
 | `/pipeline` | GET | Returns `ok` (plain text) |
 | `/baseline11` | GET | Sums query parameter values |
 | `/baseline11` | POST | Sums query parameters + request body |
 | `/baseline2` | GET | Sums query parameter values (HTTP/2 variant) |
-| `/json` | GET | Processes 50-item dataset, serializes JSON |
+| `/json/{count}` | GET | Returns `count` items from the preloaded dataset |
 | `/compression` | GET | Gzip-compressed large JSON response |
 | `/db` | GET | SQLite range query with JSON response |
-| `/async-db` | GET | PostgreSQL async queries |
-| `/upload` | POST | Receives body, returns byte count |
-| `/static/{filename}` | GET | Serves preloaded static files with MIME types |
+| `/async-db` | GET | PostgreSQL async range query |
+| `/upload` | POST | Streams request body, returns byte count |
+| `/static/*` | GET | Serves files from `/data/static` with MIME types and ETag support |
+| `/ws` | GET | WebSocket echo — reflects text, binary, and ping/pong frames |
 
-## Architecture
+## Notes
 
-- **Zero-allocation routing** — FrozenDictionary + Span<T> based, no string allocations
-- **Custom HTTP parser** — RFC 9110/9112 compliant, SequenceReader<byte> based
-- **HTTP/2 support** — ALPN negotiation, HPACK compression, binary framing
-- **System.IO.Pipelines** — High-performance I/O with PipeReader/PipeWriter
-- **Compiled endpoint invokers** — Expression trees eliminate per-request reflection
-- **Pre-computed responses** — JSON and static files cached at startup
-- **HTTP/1.1 on port 8080**, HTTP/1+2 on port 8443 with TLS
+- HTTP/1.1 on port 8080, HTTP/1+2+3 on port 8443 (TCP **and** UDP for QUIC), h1+TLS on port 8081
+- HTTP/3 via MsQuic (`libmsquic` installed in the runtime image); ALPN negotiation handles h2/h3 upgrade
+- TLS certs loaded from `$TLS_CERT` / `$TLS_KEY` (default `/certs/server.crt` + `/certs/server.key`)
+- Static files served from the `/data/static` volume mount at runtime; no files baked into the image
+- JSON responses use source-generated `JsonSerializerContext` (`AppJsonContext`) so the hot path avoids reflection
+- Postgres pooled via `Npgsql.NpgsqlDataSource` with multiplexing, built once at startup from `DATABASE_URL`
+- WebSocket endpoint at `/ws` handles text, binary, and ping/pong frames; non-upgrade requests to `/ws` return 400
+- Source split: `Program.cs` (startup + routing), `Models.cs` (DTOs + JSON context), `Tests/` (one file per test profile)
