@@ -18,7 +18,6 @@ WORKDIR /app
 
 COPY composer.json ./
 
-RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf && echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 ENV COMPOSER_IPRESOLVE=4
 ENV COMPOSER_PROCESS_TIMEOUT=2000
 RUN APP_ENV=prod COMPOSER_MAX_PARALLEL_HTTP=1 composer install --no-dev --optimize-autoloader --no-scripts --no-interaction --prefer-dist
