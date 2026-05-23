@@ -1,0 +1,29 @@
+{
+  "display_name": "aspnet-minimal-twinflow",
+  "language": "C#",
+  "type": "tuned",
+  "engine": "kestrel",
+  "description": "Minimal ASP.NET Core server using .NET 10 with Kestrel + Twinflow and minimal API routing.",
+  "repo": "https://github.com/dotnet/aspnetcore",
+  "enabled": true,
+  "tests": [
+    "baseline",
+    "pipelined",
+    "limited-conn",
+    "json",
+    "json-comp",
+    "json-tls",
+    "upload",
+    "api-4",
+    "api-16",
+    "static",
+    "async-db",
+    "crud",
+    "fortunes",
+    "baseline-h2",
+    "static-h2",
+    "baseline-h2c",
+    "json-h2c"
+  ],
+  "maintainers": ["MDA2AV"]
+}
