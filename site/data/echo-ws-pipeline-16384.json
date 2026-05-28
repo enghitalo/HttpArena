@@ -114,6 +114,25 @@
     "status_5xx": 0
   },
   {
+    "framework": "genhttp-11",
+    "language": "C#",
+    "rps": 3687198,
+    "avg_latency": "3.20ms",
+    "p99_latency": "3.28ms",
+    "cpu": "6062.3%",
+    "memory": "974MiB",
+    "connections": 16384,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 16,
+    "bandwidth": "24.91MB/s",
+    "reconnects": 0,
+    "status_2xx": 18435991,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "node-websocket",
     "language": "JS",
     "rps": 3564641,
