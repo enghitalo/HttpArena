@@ -1,5 +1,7 @@
 ﻿using GenHTTP.Api.Content;
 
+using GenHTTP.Modules.Compression;
+using GenHTTP.Modules.Compression.Algorithms;
 using GenHTTP.Modules.IO;
 using GenHTTP.Modules.Layouting;
 using GenHTTP.Modules.Layouting.Provider;
@@ -35,7 +37,10 @@ public static class Project
     {
         if (Directory.Exists("/data/static"))
         {
-            app.Add("static", Resources.From(ResourceTree.FromDirectory("/data/static")));
+            var handler = PreCompressedResources.From(ResourceTree.FromDirectory("/data/static"))
+                                                .Add(new BrotliAlgorithm());
+            
+            app.Add("static", handler);
         }
 
         return app;
