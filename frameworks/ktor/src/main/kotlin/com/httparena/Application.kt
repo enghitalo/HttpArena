@@ -1,6 +1,7 @@
 package com.httparena
 
 import io.ktor.http.*
+import io.ktor.network.util.DefaultByteBufferPool
 import io.ktor.serialization.kotlinx.json.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
@@ -14,8 +15,10 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
 import io.ktor.utils.io.*
+import io.ktor.utils.io.pool.useInstance
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
+import kotlinx.io.Buffer
 import org.jetbrains.exposed.v1.core.between
 import org.jetbrains.exposed.v1.r2dbc.selectAll
 import org.jetbrains.exposed.v1.r2dbc.transactions.suspendTransaction
@@ -185,14 +188,12 @@ private fun Application.configureRouting(appData: AppData) {
          * https://www.http-arena.com/docs/test-profiles/h1/isolated/upload/
          */
         post("/upload") {
-            val body = call.receiveChannel()
-            val sink = DevNull.asByteWriteChannel()
-            val totalBytes = try {
-                body.copyTo(sink)
-            } finally {
-                sink.flushAndClose()
-            }
-            call.respondText(totalBytes.toString(), ContentType.Text.Plain)
+            val channel = call.request.receiveChannel()
+            val totalBytes = channel.readTo(DevNull)
+            call.respondText(
+                totalBytes.toString(),
+                ContentType.Text.Plain
+            )
         }
 
         /**

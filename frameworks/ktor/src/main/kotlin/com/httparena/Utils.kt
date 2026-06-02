@@ -1,5 +1,6 @@
 package com.httparena
 
+import io.ktor.utils.io.core.discard
 import io.r2dbc.pool.ConnectionPool
 import io.r2dbc.pool.ConnectionPoolConfiguration
 import io.r2dbc.postgresql.PostgresqlConnectionConfiguration
@@ -25,7 +26,9 @@ import java.util.Base64
 object DevNull : RawSink {
     override fun close() {}
     override fun flush() {}
-    override fun write(source: Buffer, byteCount: Long) {}
+    override fun write(source: Buffer, byteCount: Long) {
+        source.discard(byteCount)
+    }
 }
 
 const val CERT_PATH = "/certs/server.crt"
