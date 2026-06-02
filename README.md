@@ -4,7 +4,7 @@
 
 HTTP framework benchmark platform.
 
-27 test profiles. 64-core dedicated hardware. Same conditions for every framework.
+28 test profiles. 64-core dedicated hardware. Same conditions for every framework.
 
 [View Leaderboard](https://www.http-arena.com/) | [Documentation](https://www.http-arena.com/docs/) | [Add a Framework](https://www.http-arena.com/docs/add-framework/)
 
