@@ -6,8 +6,10 @@ site/resources/
 *.o
 *.exe
 .idea/
+.gradle/
 obj/
 bin/
+frameworks/*/build/
 !frameworks/fletch/bin/
 target/
 frameworks/blitz/zig-linux-*
