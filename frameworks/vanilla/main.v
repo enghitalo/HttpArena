@@ -60,7 +60,7 @@ struct DbResp {
 
 struct Shared {
 mut:
-	db      &pg.DB
+	pool    pg.ConnectionPool
 	dataset []DatasetItem
 }
 
@@ -117,25 +117,42 @@ fn (mut sh Shared) async_db(min i64, max i64, limit i64) string {
 	if lim > 50 {
 		lim = 50
 	}
-	rows := sh.db.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3',
-		[min.str(), max.str(), lim.str()]) or { return '{"items":[],"count":0}' }
+	mut conn := sh.pool.acquire() or { return '{"items":[],"count":0}' }
+	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3',
+		[min.str(), max.str(), lim.str()]) or {
+		sh.pool.release(conn)
+		return '{"items":[],"count":0}'
+	}
+	sh.pool.release(conn)
 	mut items := []DbItem{cap: rows.len}
 	for row in rows {
 		items << DbItem{
-			id:       row.val(0).int()
-			name:     row.val(1)
-			category: row.val(2)
-			price:    row.val(3).int()
-			quantity: row.val(4).int()
-			active:   row.val(5) == 't'
-			tags:     json.decode([]string, row.val(6)) or { [] }
+			id:       nn(row.vals[0]).int()
+			name:     nn(row.vals[1])
+			category: nn(row.vals[2])
+			price:    nn(row.vals[3]).int()
+			quantity: nn(row.vals[4]).int()
+			active:   nn(row.vals[5]) == 't'
+			tags:     json.decode([]string, nn3(row.vals[6], '[]')) or { [] }
 			rating:   Rating{
-				score: row.val(7).i64()
-				count: row.val(8).i64()
+				score: nn(row.vals[7]).i64()
+				count: nn(row.vals[8]).i64()
 			}
 		}
 	}
 	return json.encode(DbResp{ items: items, count: items.len })
+}
+
+// nn unwraps a nullable column value to a plain string ('' for NULL).
+@[inline]
+fn nn(v ?string) string {
+	return v or { '' }
+}
+
+// nn3 unwraps a nullable column value with a custom default.
+@[inline]
+fn nn3(v ?string, d string) string {
+	return v or { d }
 }
 
 // qint reads a query parameter as an integer (0 if absent / non-numeric).
@@ -216,19 +233,45 @@ fn ok(ctype string, body string) []u8 {
 	return sb
 }
 
-fn main() {
-	conninfo := os.getenv_opt('DATABASE_URL') or { 'postgres://bench:bench@localhost:5432/benchmark' }
-	mut db := pg.connect_with_conninfo(conninfo, pg.PoolConfig{})!
-	if mc := os.getenv_opt('DATABASE_MAX_CONN') {
-		db.set_max_open_conns(mc.int())
+// parse_db_url turns postgres://user:pass@host:port/dbname into a pg.Config.
+fn parse_db_url(u string) pg.Config {
+	mut s := u
+	if s.contains('://') {
+		s = s.all_after('://')
 	}
+	creds := s.all_before('@')
+	rest := s.all_after('@')
+	host_port := rest.all_before('/')
+	mut port := 5432
+	if host_port.contains(':') {
+		port = host_port.all_after(':').int()
+	}
+	return pg.Config{
+		host:     host_port.all_before(':')
+		port:     port
+		user:     creds.all_before(':')
+		password: creds.all_after(':')
+		dbname:   rest.all_after('/')
+	}
+}
+
+fn main() {
+	url := os.getenv_opt('DATABASE_URL') or { 'postgres://bench:bench@localhost:5432/benchmark' }
+	mut size := (os.getenv_opt('DATABASE_MAX_CONN') or { '64' }).int()
+	if size < 1 {
+		size = 64
+	}
+	if size > 200 {
+		size = 200 // leave headroom under Postgres max_connections
+	}
+	mut pool := pg.new_connection_pool(parse_db_url(url), size)!
 
 	dataset_path := os.getenv_opt('DATASET_PATH') or { '/data/dataset.json' }
 	dataset_raw := os.read_file(dataset_path) or { '[]' }
 	dataset := json.decode([]DatasetItem, dataset_raw) or { []DatasetItem{} }
 
 	mut sh := Shared{
-		db:      db
+		pool:    pool
 		dataset: dataset
 	}
 

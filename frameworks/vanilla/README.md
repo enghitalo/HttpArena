@@ -18,7 +18,7 @@ epoll I/O, lock-free, copy-free, with `SO_REUSEPORT`.
 
 ## Stack
 
-* [V](https://vlang.io) standard toolchain (built from source)
+* [V](https://vlang.io) 0.5.1 (pinned prebuilt release)
 * [vanilla](https://github.com/enghitalo/vanilla) — raw epoll HTTP server
 * `db.pg` (stdlib) — pooled PostgreSQL driver, sized from `DATABASE_MAX_CONN`
 * `json` (stdlib) — dataset parsing + response serialization
