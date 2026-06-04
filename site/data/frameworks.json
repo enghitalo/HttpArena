@@ -192,6 +192,13 @@
     "type": "engine",
     "engine": "libuv"
   },
+  "fishcake": {
+    "dir": "fishcake",
+    "description": "CodeGreen, a 1:1 Kotlin port of GenHTTP, on its internal Netty-based engine with kotlinx.serialization and JDBC (HikariCP).",
+    "repo": "https://github.com/dotnet-web-stack/CodeGreen",
+    "type": "production",
+    "engine": "codegreen"
+  },
   "flask": {
     "dir": "flask",
     "description": "Flask web framework on Gunicorn with sync workers",

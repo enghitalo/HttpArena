@@ -58,6 +58,26 @@
     "status_5xx": 0
   },
   {
+    "framework": "fishcake",
+    "language": "Kotlin",
+    "rps": 450035,
+    "avg_latency": "8.63ms",
+    "p99_latency": "104.10ms",
+    "cpu": "3709.0%",
+    "memory": "5.0GiB",
+    "connections": 4096,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "175.87MB/s",
+    "input_bw": "38.63MB/s",
+    "reconnects": 31864,
+    "status_2xx": 6750528,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "genhttp",
     "language": "C#",
     "rps": 484308,

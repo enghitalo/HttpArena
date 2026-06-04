@@ -352,6 +352,26 @@
     "status_5xx": 0
   },
   {
+    "framework": "fishcake",
+    "language": "Kotlin",
+    "rps": 602123,
+    "avg_latency": "2.11ms",
+    "p99_latency": "17.90ms",
+    "cpu": "3445.7%",
+    "memory": "3.1GiB",
+    "connections": 4096,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "73.48MB/s",
+    "input_bw": "46.51MB/s",
+    "reconnects": 301064,
+    "status_2xx": 3010618,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "flask",
     "language": "Python",
     "rps": 107404,
