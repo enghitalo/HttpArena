@@ -28,5 +28,4 @@ ENTRYPOINT ["java", \
   "-Dio.netty.buffer.checkAccessible=false", \
   "-Dio.netty.leakDetection.level=disabled", \
   "-Dio.netty.recycler.maxCapacityPerThread=4096", \
-  "-Dio.netty.eventLoopThreads=0", \
   "-jar", "fishcake.jar"]
