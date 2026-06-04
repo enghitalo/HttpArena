@@ -14,11 +14,13 @@ import org.codegreen.modules.webservices.addService
 /**
  * Builds the routing tree, mirroring the C# `genhttp-11` entry's `Project.Create()`.
  *
- * Compression, static files, websockets and TLS/HTTP-2 from the original entry rely on
- * modules the CodeGreen port does not provide yet and are omitted; the implemented profiles
- * are baseline, pipelined, json, upload, async-db and crud.
+ * `static` serves /data/static with pre-compressed variant selection (see [StaticFiles]).
+ * Websockets and HTTP-2/3 from the original entry rely on modules the CodeGreen port does not
+ * provide yet and are omitted.
  */
 object Project {
+
+    private val STATIC_DIR: String = System.getenv("STATIC_DIR") ?: "/data/static"
 
     fun create(): LayoutBuilder =
         Layout.create()
@@ -29,4 +31,5 @@ object Project {
             .addService<JsonService>("json")
             .addService<AsyncDatabase>("async-db")
             .add("crud", Layout.create().addService<Crud>("items"))
+            .add("static", StaticFiles.from(STATIC_DIR))
 }
