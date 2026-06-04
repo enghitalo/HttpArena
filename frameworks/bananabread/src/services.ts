@@ -1,6 +1,7 @@
 /**
  * Webservices for the HttpArena workloads, on Seagreen's decorator-based reflection stack.
  */
+import { RedisClient } from "bun";
 import {
   ContentType,
   ProviderException,
@@ -23,11 +24,23 @@ import {
 import * as Data from "./data.ts";
 import { type CrudCreateRequest, type CrudUpdateRequest, type DbItem, ListWithCount, type ProcessedItem } from "./model.ts";
 
-/** In-process 200 ms TTL cache for the cached single-item read. */
-class TtlCache {
+/**
+ * Single-item read cache for the cache-aside workload. The validation harness fires its two
+ * cache probes on separate connections, which `SO_REUSEPORT` may route to different worker
+ * processes — so a per-process map would report MISS twice. When REDIS_URL is provided the cache
+ * is backed by Redis (Bun's built-in client) and therefore shared across workers; otherwise it
+ * falls back to an in-process TTL map (correct for a single worker).
+ */
+interface ItemCache {
+  get(id: number): Promise<string | undefined>;
+  set(id: number, body: string): Promise<void>;
+  invalidate(id: number): Promise<void>;
+}
+
+class InProcessCache implements ItemCache {
   private readonly map = new Map<number, { body: string; expiresAt: number }>();
-  constructor(private readonly ttlMs = 200) {}
-  get(id: number): string | undefined {
+  constructor(private readonly ttlMs: number) {}
+  async get(id: number): Promise<string | undefined> {
     const e = this.map.get(id);
     if (!e) return undefined;
     if (e.expiresAt <= performance.now()) {
@@ -36,14 +49,40 @@ class TtlCache {
     }
     return e.body;
   }
-  set(id: number, body: string): void {
+  async set(id: number, body: string): Promise<void> {
     this.map.set(id, { body, expiresAt: performance.now() + this.ttlMs });
   }
-  invalidate(id: number): void {
+  async invalidate(id: number): Promise<void> {
     this.map.delete(id);
   }
 }
-const cache = new TtlCache(200);
+
+class RedisCache implements ItemCache {
+  private readonly client: RedisClient;
+  constructor(
+    url: string,
+    private readonly ttlMs: number,
+  ) {
+    this.client = new RedisClient(url);
+  }
+  private key(id: number): string {
+    return `crud:item:${id}`;
+  }
+  async get(id: number): Promise<string | undefined> {
+    return (await this.client.get(this.key(id))) ?? undefined;
+  }
+  async set(id: number, body: string): Promise<void> {
+    await this.client.send("SET", [this.key(id), body, "PX", String(this.ttlMs)]);
+  }
+  async invalidate(id: number): Promise<void> {
+    await this.client.del(this.key(id));
+  }
+}
+
+const CACHE_TTL_MS = 1000;
+const cache: ItemCache = process.env.REDIS_URL
+  ? new RedisCache(process.env.REDIS_URL, CACHE_TTL_MS)
+  : new InProcessCache(CACHE_TTL_MS);
 
 export class Baseline {
   @ResourceMethod("GET")
@@ -94,21 +133,21 @@ export class Crud {
 
   @ResourceMethod("GET", ":id")
   async get(@FromPath("id") id: number, @Inject() request: Request): Promise<Response> {
-    const cached = cache.get(id);
+    const cached = await cache.get(id);
     if (cached !== undefined) {
       return request.respond().content(new StringContent(cached, ContentType.ApplicationJson)).header("X-Cache", "HIT").build();
     }
     const item = await Data.findById(id);
     if (!item) throw new ProviderException(ResponseStatus.NotFound, `Item with ID ${id} does not exist`);
     const json = JSON.stringify(item);
-    cache.set(id, json);
+    await cache.set(id, json);
     return request.respond().content(new StringContent(json, ContentType.ApplicationJson)).header("X-Cache", "MISS").build();
   }
 
   @ResourceMethod("POST")
   async create(@FromContent() item: CrudCreateRequest): Promise<Result<DbItem>> {
     await Data.upsert(item);
-    cache.invalidate(item.id);
+    await cache.invalidate(item.id);
     const created: DbItem = {
       id: item.id,
       name: item.name,
@@ -125,7 +164,7 @@ export class Crud {
   @ResourceMethod("PUT", ":id")
   async update(@FromPath("id") id: number, @FromContent() item: CrudUpdateRequest): Promise<DbItem> {
     const ok = await Data.update(id, item);
-    cache.invalidate(id);
+    await cache.invalidate(id);
     if (!ok) throw new ProviderException(ResponseStatus.NotFound, `Item with ID ${id} does not exist`);
     const updated = await Data.findById(id);
     if (!updated) throw new ProviderException(ResponseStatus.NotFound, `Item with ID ${id} does not exist`);
