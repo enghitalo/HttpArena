@@ -430,6 +430,9 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8080
 		io_multiplexing: .epoll
+		limits:          http_server.Limits{
+			max_request_bytes: 32 * 1024 * 1024 // accept the 20 MiB upload bodies
+		}
 		request_handler: fn [mut sh] (req_buffer []u8, fd int) ![]u8 {
 			return handle(req_buffer, fd, mut sh)
 		}

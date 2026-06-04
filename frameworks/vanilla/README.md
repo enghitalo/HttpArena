@@ -10,6 +10,7 @@ epoll I/O, lock-free, copy-free, with `SO_REUSEPORT`.
 |---|---|---|
 | `baseline` | `GET/POST /baseline11` | `a + b` (+ body on POST); handles chunked + TCP-fragmented requests |
 | `pipelined` | `GET /pipeline` | returns `ok` |
+| `upload` | `POST /upload` | returns body byte count (up to 20+ MiB via `max_request_bytes`) |
 | `limited-conn` | `GET /baseline11` | short-lived connections |
 | `json` | `GET /json/{count}?m=M` | single-allocation response, precomputed item prefixes |
 | `json-comp` | `GET /json/...` + `Accept-Encoding` | gzip-compressed response |
@@ -29,8 +30,5 @@ epoll I/O, lock-free, copy-free, with `SO_REUSEPORT`.
 * `DATABASE_URL`, `DATABASE_MAX_CONN` — Postgres connection + pool size
 * `DATASET_PATH` (default `/data/dataset.json`), `STATIC_DIR` (default `/data/static`)
 
-> The `upload` profile (20 MiB bodies) lands once
-> [enghitalo/vanilla#17](https://github.com/enghitalo/vanilla/pull/17)
-> (configurable `max_request_bytes`) is merged; until then vanilla caps a single
-> request at 8 MiB. HTTP/2, HTTP/3 and gRPC profiles need protocol support
-> vanilla doesn't have yet (tracked upstream).
+> HTTP/2, HTTP/3 and gRPC profiles need protocol support vanilla doesn't have
+> yet — tracked in [enghitalo/vanilla#18](https://github.com/enghitalo/vanilla/issues/18).

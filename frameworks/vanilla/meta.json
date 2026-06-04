@@ -12,6 +12,7 @@
     "limited-conn",
     "json",
     "json-comp",
+    "upload",
     "static",
     "async-db",
     "fortunes",
