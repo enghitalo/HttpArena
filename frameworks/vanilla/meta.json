@@ -1,0 +1,16 @@
+{
+  "display_name": "vanilla",
+  "language": "V",
+  "type": "production",
+  "engine": "epoll",
+  "description": "vanilla is a minimalist, high-performance HTTP server written in V: multi-threaded, non-blocking epoll I/O, lock-free, copy-free (handlers work on slices into the read buffer), with SO_REUSEPORT for kernel load balancing. Handlers are pure (request) -> []u8 functions returning raw HTTP response bytes. The JSON dataset is parsed once at startup with the stdlib json module; async-db uses the stdlib db.pg pooled driver (sized from DATABASE_MAX_CONN). Built with -prod.",
+  "repo": "https://github.com/enghitalo/vanilla",
+  "enabled": true,
+  "tests": [
+    "baseline",
+    "pipelined",
+    "json",
+    "async-db"
+  ],
+  "maintainers": ["enghitalo"]
+}
