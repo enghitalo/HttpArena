@@ -6,6 +6,7 @@ import db.pg
 import json
 import os
 import strings
+import sync
 import compress.gzip
 
 struct Rating {
@@ -57,6 +58,16 @@ mut:
 	dataset  []DatasetItem
 	prefixes []string // per item: `{…,"total":` (everything but the request-dependent total)
 	assets   map[string]StaticFile // /static/<name> -> prebuilt response
+	cache    map[int]string        // crud cache-aside: id -> item JSON
+	cache_mu &sync.RwMutex = unsafe { nil }
+}
+
+struct CrudCreate {
+	id       int
+	name     string
+	category string
+	price    int
+	quantity int
 }
 
 fn handle(req_buffer []u8, _fd int, mut sh Shared) ![]u8 {
@@ -96,11 +107,139 @@ fn handle(req_buffer []u8, _fd int, mut sh Shared) ![]u8 {
 			return f.response
 		}
 		return not_found
+	} else if route == '/crud/items' {
+		if method == 'POST' {
+			return sh.crud_create(req)
+		}
+		return sh.crud_list(qstr(req, 'category'), qint(req, 'page'), qint(req, 'limit'))
+	} else if route.starts_with('/crud/items/') {
+		id := route[12..].int()
+		if method == 'PUT' {
+			return sh.crud_update(id, req)
+		}
+		return sh.crud_get(id)
 	}
 	return not_found
 }
 
+// crud_list returns a paginated, category-filtered page of items.
+fn (mut sh Shared) crud_list(category string, page i64, limit i64) []u8 {
+	mut p := page
+	if p < 1 {
+		p = 1
+	}
+	mut lim := limit
+	if lim < 1 {
+		lim = 10
+	}
+	if lim > 100 {
+		lim = 100
+	}
+	offset := (p - 1) * lim
+	mut conn := sh.pool.acquire() or { return ok('application/json', '{"items":[],"total":0,"page":1}') }
+	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE category = \$1 ORDER BY id LIMIT \$2 OFFSET \$3',
+		[category, lim.str(), offset.str()]) or {
+		sh.pool.release(conn)
+		return ok('application/json', '{"items":[],"total":0,"page":1}')
+	}
+	trows := conn.exec_param_many('SELECT count(*) FROM items WHERE category = \$1', [category]) or {
+		[]
+	}
+	sh.pool.release(conn)
+	total := if trows.len > 0 { nn(trows[0].vals[0]).int() } else { 0 }
+	mut items := []DbItem{cap: rows.len}
+	for row in rows {
+		items << row_to_item(row)
+	}
+	mut sb := strings.new_builder(items.len * 200 + 64)
+	sb.write_string('{"items":')
+	sb.write_string(json.encode(items))
+	sb.write_string(',"total":')
+	sb.write_decimal(i64(total))
+	sb.write_string(',"page":')
+	sb.write_decimal(p)
+	sb.write_u8(`}`)
+	return ok('application/json', sb.str())
+}
+
+// crud_get returns a single item, using a cache-aside in-memory cache and
+// reporting the result via the X-Cache header (MISS on first read, HIT after).
+fn (mut sh Shared) crud_get(id int) []u8 {
+	sh.cache_mu.@rlock()
+	cached := sh.cache[id] or { '' }
+	sh.cache_mu.runlock()
+	if cached.len > 0 {
+		return ok_xcache('application/json', cached, 'HIT')
+	}
+	mut conn := sh.pool.acquire() or { return not_found }
+	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
+		[id.str()]) or {
+		sh.pool.release(conn)
+		return not_found
+	}
+	sh.pool.release(conn)
+	if rows.len == 0 {
+		return not_found
+	}
+	body := json.encode(row_to_item(rows[0]))
+	sh.cache_mu.@lock()
+	sh.cache[id] = body
+	sh.cache_mu.unlock()
+	return ok_xcache('application/json', body, 'MISS')
+}
+
+// crud_create inserts a new item from the JSON body and returns 201.
+fn (mut sh Shared) crud_create(req request_parser.HttpRequest) []u8 {
+	raw := unsafe { tos(&req.buffer[req.body.start], req.body.len) }
+	c := json.decode(CrudCreate, raw) or { return bad_request }
+	mut conn := sh.pool.acquire() or { return bad_request }
+	conn.exec_param_many("INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
+		[c.id.str(), c.name, c.category, c.price.str(), c.quantity.str()]) or {
+		sh.pool.release(conn)
+		return bad_request
+	}
+	sh.pool.release(conn)
+	return created
+}
+
+// crud_update updates an item and invalidates its cache entry.
+fn (mut sh Shared) crud_update(id int, req request_parser.HttpRequest) []u8 {
+	raw := unsafe { tos(&req.buffer[req.body.start], req.body.len) }
+	c := json.decode(CrudCreate, raw) or { return bad_request }
+	mut conn := sh.pool.acquire() or { return bad_request }
+	conn.exec_param_many('UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
+		[id.str(), c.name, c.category, c.price.str(), c.quantity.str()]) or {
+		sh.pool.release(conn)
+		return bad_request
+	}
+	sh.pool.release(conn)
+	sh.cache_mu.@lock()
+	sh.cache.delete(id)
+	sh.cache_mu.unlock()
+	return ok('application/json', '{"status":"ok"}')
+}
+
+fn row_to_item(row pg.Row) DbItem {
+	return DbItem{
+		id:       nn(row.vals[0]).int()
+		name:     nn(row.vals[1])
+		category: nn(row.vals[2])
+		price:    nn(row.vals[3]).int()
+		quantity: nn(row.vals[4]).int()
+		active:   nn(row.vals[5]) == 't'
+		tags:     json.decode([]string, nn3(row.vals[6], '[]')) or { [] }
+		rating:   Rating{
+			score: nn(row.vals[7]).i64()
+			count: nn(row.vals[8]).i64()
+		}
+	}
+}
+
 const not_found = 'HTTP/1.1 404 Not Found\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+const created = 'HTTP/1.1 201 Created\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
 // json_response builds the FULL HTTP response (headers + body) for /json in a
 // single allocation — no per-request reflection and no body→response copy.
@@ -254,6 +393,13 @@ fn qint(req request_parser.HttpRequest, key string) i64 {
 	return unsafe { tos(&req.buffer[s.start], s.len) }.i64()
 }
 
+// qstr reads a query parameter as a string ('' if absent). Clones so the value
+// outlives the request buffer (it is passed to the DB driver).
+fn qstr(req request_parser.HttpRequest, key string) string {
+	s := req.get_query_slice(key.bytes()) or { return '' }
+	return unsafe { tos(&req.buffer[s.start], s.len) }.clone()
+}
+
 fn clamp_count(n i64, max int) int {
 	if n < 0 {
 		return 0
@@ -318,6 +464,20 @@ fn strconv_hex(s string) int {
 fn ok(ctype string, body string) []u8 {
 	mut sb := strings.new_builder(body.len + 96)
 	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
+	sb.write_string(ctype)
+	sb.write_string('\r\nContent-Length: ')
+	sb.write_decimal(i64(body.len))
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
+	sb.write_string(body)
+	return sb
+}
+
+// ok_xcache builds a JSON response carrying an X-Cache: HIT|MISS header.
+fn ok_xcache(ctype string, body string, cache string) []u8 {
+	mut sb := strings.new_builder(body.len + 96)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: ')
+	sb.write_string(cache)
+	sb.write_string('\r\nContent-Type: ')
 	sb.write_string(ctype)
 	sb.write_string('\r\nContent-Length: ')
 	sb.write_decimal(i64(body.len))
@@ -425,6 +585,8 @@ fn main() {
 		dataset:  dataset
 		prefixes: prefixes
 		assets:   assets
+		cache:    map[int]string{}
+		cache_mu: sync.new_rwmutex()
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
