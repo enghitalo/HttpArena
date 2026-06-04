@@ -168,12 +168,15 @@ if has_test "crud"; then
 
     REDIS_CONTAINER="httparena-redis"
     REDIS_URL="redis://localhost:6379"
-    REDIS_CPUSET="${REDIS_CPUSET:-0,64}"
+    # Validation is correctness-only, so the Redis sidecar is not pinned to specific
+    # cores by default (benchmarking pins it via scripts/lib/redis.sh). Set REDIS_CPUSET
+    # explicitly to restore pinning; left unset it runs unpinned and works on any host.
+    REDIS_CPUSET="${REDIS_CPUSET:-}"
 
-    echo "[redis] Starting Redis sidecar (cpuset=$REDIS_CPUSET)"
+    echo "[redis] Starting Redis sidecar${REDIS_CPUSET:+ (cpuset=$REDIS_CPUSET)}"
     docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
     docker run -d --rm --name "$REDIS_CONTAINER" --network host \
-        --cpuset-cpus="$REDIS_CPUSET" \
+        ${REDIS_CPUSET:+--cpuset-cpus="$REDIS_CPUSET"} \
         --ulimit memlock=-1:-1 \
         --ulimit nofile=1048576:1048576 \
         redis:7-alpine \

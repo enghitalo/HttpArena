@@ -3,6 +3,7 @@ using System.Security.Cryptography.X509Certificates;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Caching.Memory;
+using Twinflow;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
@@ -13,6 +14,7 @@ var certPath = Environment.GetEnvironmentVariable("TLS_CERT") ?? "/certs/server.
 var keyPath = Environment.GetEnvironmentVariable("TLS_KEY") ?? "/certs/server.key";
 var hasCert = File.Exists(certPath) && File.Exists(keyPath);
 
+//builder.WebHost.UseTwinflow(o => o.ReactorCount = 8);
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.Limits.Http2.MaxStreamsPerConnection = 256;
