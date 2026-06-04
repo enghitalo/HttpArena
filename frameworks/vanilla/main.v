@@ -6,6 +6,7 @@ import db.pg
 import json
 import os
 import strings
+import compress.gzip
 
 struct Rating {
 	score i64
@@ -40,11 +41,22 @@ struct DbResp {
 	count int
 }
 
+struct Fortune {
+	id      int
+	message string
+}
+
+// A static asset preloaded into memory with its full HTTP response.
+struct StaticFile {
+	response []u8
+}
+
 struct Shared {
 mut:
 	pool     pg.ConnectionPool
 	dataset  []DatasetItem
 	prefixes []string // per item: `{…,"total":` (everything but the request-dependent total)
+	assets   map[string]StaticFile // /static/<name> -> prebuilt response
 }
 
 fn handle(req_buffer []u8, _fd int, mut sh Shared) ![]u8 {
@@ -69,13 +81,26 @@ fn handle(req_buffer []u8, _fd int, mut sh Shared) ![]u8 {
 		if m == 0 {
 			m = 1
 		}
+		if accepts_gzip(req) {
+			// json-comp profile: gzip the body and set Content-Encoding.
+			return ok_gzip('application/json', sh.json_body(count, m))
+		}
 		return sh.json_response(count, m)
 	} else if route == '/async-db' {
 		return ok('application/json', sh.async_db(qint(req, 'min'), qint(req, 'max'),
 			qint(req, 'limit')))
+	} else if route == '/fortunes' {
+		return ok('text/html; charset=utf-8', sh.fortunes())
+	} else if route.starts_with('/static/') {
+		if f := sh.assets[route[8..]] {
+			return f.response
+		}
+		return not_found
 	}
-	return ok('text/plain', 'not found')
+	return not_found
 }
+
+const not_found = 'HTTP/1.1 404 Not Found\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
 // json_response builds the FULL HTTP response (headers + body) for /json in a
 // single allocation — no per-request reflection and no body→response copy.
@@ -106,6 +131,61 @@ fn (sh &Shared) json_response(count int, m i64) []u8 {
 	sb.write_decimal(i64(count))
 	sb.write_u8(`}`)
 	return sb
+}
+
+// json_body builds just the /json body string (used for the gzip path).
+fn (sh &Shared) json_body(count int, m i64) string {
+	mut sb := strings.new_builder(count * 224 + 32)
+	sb.write_string('{"items":[')
+	for i in 0 .. count {
+		if i > 0 {
+			sb.write_u8(`,`)
+		}
+		sb.write_string(sh.prefixes[i])
+		sb.write_decimal(sh.dataset[i].price * sh.dataset[i].quantity * m)
+		sb.write_u8(`}`)
+	}
+	sb.write_string('],"count":')
+	sb.write_decimal(i64(count))
+	sb.write_u8(`}`)
+	return sb.str()
+}
+
+// fortunes queries the fortune table, appends the runtime row, sorts by message
+// and renders the HTML table (escaped). 199 seeded + 1 runtime + header = 201 <tr>.
+fn (mut sh Shared) fortunes() string {
+	mut fortunes := []Fortune{}
+	mut conn := sh.pool.acquire() or {
+		return '<!doctype html><html><body><table></table></body></html>'
+	}
+	rows := conn.exec_param_many('SELECT id, message FROM fortune', []) or { [] }
+	sh.pool.release(conn)
+	for row in rows {
+		fortunes << Fortune{
+			id:      nn(row.vals[0]).int()
+			message: nn(row.vals[1])
+		}
+	}
+	fortunes << Fortune{
+		id:      0
+		message: 'Additional fortune added at request time.'
+	}
+	fortunes.sort(a.message < b.message)
+	mut sb := strings.new_builder(32768)
+	sb.write_string('<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
+	for f in fortunes {
+		sb.write_string('<tr><td>')
+		sb.write_decimal(i64(f.id))
+		sb.write_string('</td><td>')
+		sb.write_string(escape_html(f.message))
+		sb.write_string('</td></tr>')
+	}
+	sb.write_string('</table></body></html>')
+	return sb.str()
+}
+
+fn escape_html(s string) string {
+	return s.replace_each(['&', '&amp;', '<', '&lt;', '>', '&gt;', '"', '&quot;', "'", '&apos;'])
 }
 
 // digits returns the number of decimal digits in a non-negative integer.
@@ -246,6 +326,40 @@ fn ok(ctype string, body string) []u8 {
 	return sb
 }
 
+// ok_gzip gzip-compresses the body and sets Content-Encoding: gzip.
+fn ok_gzip(ctype string, body string) []u8 {
+	gz := gzip.compress(body.bytes()) or { return ok(ctype, body) }
+	mut sb := strings.new_builder(gz.len + 128)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: ')
+	sb.write_string(ctype)
+	sb.write_string('\r\nContent-Length: ')
+	sb.write_decimal(i64(gz.len))
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
+	unsafe { sb.write_ptr(gz.data, gz.len) }
+	return sb
+}
+
+// accepts_gzip reports whether the request advertises gzip in Accept-Encoding.
+fn accepts_gzip(req request_parser.HttpRequest) bool {
+	ae := req.get_header_value_slice('Accept-Encoding') or { return false }
+	return unsafe { tos(&req.buffer[ae.start], ae.len) }.contains('gzip')
+}
+
+// content_type maps a file extension to a MIME type for the static handler.
+fn content_type(name string) string {
+	ext := name.all_after_last('.')
+	return match ext {
+		'css' { 'text/css' }
+		'js' { 'application/javascript' }
+		'json' { 'application/json' }
+		'html' { 'text/html' }
+		'svg' { 'image/svg+xml' }
+		'webp' { 'image/webp' }
+		'woff2' { 'font/woff2' }
+		else { 'application/octet-stream' }
+	}
+}
+
 // parse_db_url turns postgres://user:pass@host:port/dbname into a pg.Config.
 fn parse_db_url(u string) pg.Config {
 	mut s := u
@@ -292,10 +406,25 @@ fn main() {
 		prefixes << enc#[..-1] + ',"total":'
 	}
 
+	// Preload static assets into memory as ready-to-send responses (originals
+	// only; skip the precompressed .gz/.br siblings — we serve identity).
+	mut assets := map[string]StaticFile{}
+	static_dir := os.getenv_opt('STATIC_DIR') or { '/data/static' }
+	for name in os.ls(static_dir) or { []string{} } {
+		if name.ends_with('.gz') || name.ends_with('.br') {
+			continue
+		}
+		bytes := os.read_bytes('${static_dir}/${name}') or { continue }
+		assets[name] = StaticFile{
+			response: static_response(content_type(name), bytes)
+		}
+	}
+
 	mut sh := Shared{
 		pool:     pool
 		dataset:  dataset
 		prefixes: prefixes
+		assets:   assets
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
@@ -306,4 +435,16 @@ fn main() {
 		}
 	})!
 	server.run()
+}
+
+// static_response prebuilds the full HTTP response for a static file.
+fn static_response(ctype string, body []u8) []u8 {
+	mut sb := strings.new_builder(body.len + 96)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
+	sb.write_string(ctype)
+	sb.write_string('\r\nContent-Length: ')
+	sb.write_decimal(i64(body.len))
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
+	unsafe { sb.write_ptr(body.data, body.len) }
+	return sb
 }
