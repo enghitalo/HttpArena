@@ -8,11 +8,9 @@ WORKDIR /app
 COPY . .
 
 # CodeGreen (the Kotlin GenHTTP port) is consumed as a composite build, wired in
-# settings.gradle.kts via includeBuild("codegreen"). Temporarily pinned to the
-# add-compression-tls branch (CodeGreen PR dotnet-web-stack/CodeGreen#9), which carries the
-# response-compression module + TLS engine support these profiles require. Repoint to
-# stream-bodies once that PR merges.
-RUN git clone --depth 1 --branch add-compression-tls https://github.com/dotnet-web-stack/CodeGreen.git codegreen
+# settings.gradle.kts via includeBuild("codegreen"). Cloned from main, which carries the
+# request-body streaming, response-compression, TLS and pipelined-flush work these profiles use.
+RUN git clone --depth 1 --branch main https://github.com/dotnet-web-stack/CodeGreen.git codegreen
 
 RUN chmod +x ./gradlew && ./gradlew shadowJar --no-daemon
 
