@@ -9,7 +9,15 @@ import type { CrudCreateRequest, CrudUpdateRequest, DatasetItem, DbItem } from "
 const datasetFile = Bun.file(process.env.DATASET_PATH ?? "/data/dataset.json");
 export const dataset: DatasetItem[] = (await datasetFile.exists()) ? ((await datasetFile.json()) as DatasetItem[]) : [];
 
-const sql = process.env.DATABASE_URL ? new SQL(process.env.DATABASE_URL) : null;
+// One Bun.SQL pool lives per worker process (Seagreen forks one worker per core), and the pools
+// must collectively stay under PostgreSQL's max_connections (the harness caps it at 256). The
+// default per-pool size (~10) × ~64 workers ≈ 640 connections blows past that, and the overflow
+// fails to open under load — surfacing as 5xx (and reconnect storms that wreck throughput). Size
+// each worker's pool so workers × poolMax stays well under 256 (~200, leaving headroom for
+// reserved/health connections); this matches the worker count main.ts derives.
+const workerCount = Number(process.env.WORKERS) || navigator.hardwareConcurrency || 1;
+const poolMax = Math.max(1, Math.floor(200 / workerCount));
+const sql = process.env.DATABASE_URL ? new SQL(process.env.DATABASE_URL, { max: poolMax }) : null;
 export const dbAvailable = sql !== null;
 
 // biome-ignore lint/suspicious/noExplicitAny: Bun.SQL rows are untyped records
