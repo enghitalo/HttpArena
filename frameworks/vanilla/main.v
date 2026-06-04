@@ -24,24 +24,6 @@ struct DatasetItem {
 	rating   Rating
 }
 
-// Item returned by /json — the dataset item plus the computed `total`.
-struct OutItem {
-	id       i64
-	name     string
-	category string
-	price    i64
-	quantity i64
-	active   bool
-	tags     []string
-	rating   Rating
-	total    i64
-}
-
-struct JsonResp {
-	items []OutItem
-	count int
-}
-
 struct DbItem {
 	id       int
 	name     string
@@ -60,8 +42,9 @@ struct DbResp {
 
 struct Shared {
 mut:
-	pool    pg.ConnectionPool
-	dataset []DatasetItem
+	pool     pg.ConnectionPool
+	dataset  []DatasetItem
+	prefixes []string // per item: `{…,"total":` (everything but the request-dependent total)
 }
 
 fn handle(req_buffer []u8, _fd int, mut sh Shared) ![]u8 {
@@ -86,27 +69,57 @@ fn handle(req_buffer []u8, _fd int, mut sh Shared) ![]u8 {
 		if m == 0 {
 			m = 1
 		}
-		mut items := []OutItem{cap: count}
-		for i in 0 .. count {
-			d := sh.dataset[i]
-			items << OutItem{
-				id:       d.id
-				name:     d.name
-				category: d.category
-				price:    d.price
-				quantity: d.quantity
-				active:   d.active
-				tags:     d.tags
-				rating:   d.rating
-				total:    d.price * d.quantity * m
-			}
-		}
-		return ok('application/json', json.encode(JsonResp{ items: items, count: items.len }))
+		return sh.json_response(count, m)
 	} else if route == '/async-db' {
 		return ok('application/json', sh.async_db(qint(req, 'min'), qint(req, 'max'),
 			qint(req, 'limit')))
 	}
 	return ok('text/plain', 'not found')
+}
+
+// json_response builds the FULL HTTP response (headers + body) for /json in a
+// single allocation — no per-request reflection and no body→response copy.
+// Only `total` (price*quantity*m) varies per request; the rest is a precomputed
+// prefix. Content-Length is computed up front so everything lands in one buffer.
+fn (sh &Shared) json_response(count int, m i64) []u8 {
+	mut clen := 21 + digits(i64(count)) // len('{"items":[') + len('],"count":') + '}' + count digits
+	if count > 0 {
+		clen += count - 1 // item separators
+	}
+	for i in 0 .. count {
+		t := sh.dataset[i].price * sh.dataset[i].quantity * m
+		clen += sh.prefixes[i].len + digits(t) + 1 // prefix + total + '}'
+	}
+	mut sb := strings.new_builder(clen + 96)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
+	sb.write_decimal(i64(clen))
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n{"items":[')
+	for i in 0 .. count {
+		if i > 0 {
+			sb.write_u8(`,`)
+		}
+		sb.write_string(sh.prefixes[i])
+		sb.write_decimal(sh.dataset[i].price * sh.dataset[i].quantity * m)
+		sb.write_u8(`}`)
+	}
+	sb.write_string('],"count":')
+	sb.write_decimal(i64(count))
+	sb.write_u8(`}`)
+	return sb
+}
+
+// digits returns the number of decimal digits in a non-negative integer.
+fn digits(n i64) int {
+	if n < 10 {
+		return 1
+	}
+	mut x := n
+	mut d := 0
+	for x > 0 {
+		d++
+		x /= 10
+	}
+	return d
 }
 
 fn (mut sh Shared) async_db(min i64, max i64, limit i64) string {
@@ -270,9 +283,19 @@ fn main() {
 	dataset_raw := os.read_file(dataset_path) or { '[]' }
 	dataset := json.decode([]DatasetItem, dataset_raw) or { []DatasetItem{} }
 
+	// Precompute each item's JSON prefix once: `{…,"rating":{…},"total":`
+	// (drop the closing brace, append the total key). Only the total value is
+	// request-dependent, so the hot path never serializes a struct.
+	mut prefixes := []string{cap: dataset.len}
+	for it in dataset {
+		enc := json.encode(it)
+		prefixes << enc#[..-1] + ',"total":'
+	}
+
 	mut sh := Shared{
-		pool:    pool
-		dataset: dataset
+		pool:     pool
+		dataset:  dataset
+		prefixes: prefixes
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
