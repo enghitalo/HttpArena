@@ -595,8 +595,8 @@ fn main() {
 		limits:          http_server.Limits{
 			max_request_bytes: 32 * 1024 * 1024 // accept the 20 MiB upload bodies
 		}
-		request_handler: fn [mut sh] (req_buffer []u8, fd int) ![]u8 {
-			return handle(req_buffer, fd, mut sh)
+		request_handler: fn [mut sh] (req_buffer []u8, fd int, mut out []u8) ! {
+			out << handle(req_buffer, fd, mut sh)!
 		}
 	})!
 	server.run()
