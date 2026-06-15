@@ -386,7 +386,31 @@ fn (mut sh Shared) fortunes() string {
 }
 
 fn escape_html(s string) string {
-	return s.replace_each(['&', '&amp;', '<', '&lt;', '>', '&gt;', '"', '&quot;', "'", '&apos;'])
+	// Fast path: most fortune messages contain no special characters, so return
+	// the original with no allocation instead of replace_each's 5 full-string
+	// passes (each scanning + reallocating). Only escape when there's something to.
+	mut needs := false
+	for c in s {
+		if c == `&` || c == `<` || c == `>` || c == `"` || c == `'` {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return s
+	}
+	mut b := strings.new_builder(s.len + 16)
+	for c in s {
+		match c {
+			`&` { b.write_string('&amp;') }
+			`<` { b.write_string('&lt;') }
+			`>` { b.write_string('&gt;') }
+			`"` { b.write_string('&quot;') }
+			`'` { b.write_string('&apos;') }
+			else { b.write_u8(c) }
+		}
+	}
+	return b.str()
 }
 
 // digits returns the number of decimal digits in a non-negative integer.
@@ -412,10 +436,21 @@ fn (mut sh Shared) async_db(min i64, max i64, limit i64) string {
 		lim = 50
 	}
 	mut conn := sh.pool.acquire() or { return '{"items":[],"count":0}' }
-	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3',
-		[min.str(), max.str(), lim.str()]) or {
-		sh.pool.release(conn)
-		return '{"items":[],"count":0}'
+	// Prepared statement: PostgreSQL parses the SQL once per connection instead of
+	// on every request (exec_param_many re-parses each call). Lazily prepare on the
+	// connection's first use — prepared statements are per-session and the pool
+	// reuses sessions, so after warmup every connection serves exec_prepared.
+	adb_params := [min.str(), max.str(), lim.str()]
+	rows := conn.exec_prepared('vanilla_async_db', adb_params) or {
+		conn.prepare('vanilla_async_db', 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3',
+			3) or {
+			sh.pool.release(conn)
+			return '{"items":[],"count":0}'
+		}
+		conn.exec_prepared('vanilla_async_db', adb_params) or {
+			sh.pool.release(conn)
+			return '{"items":[],"count":0}'
+		}
 	}
 	sh.pool.release(conn)
 	mut items := []DbItem{cap: rows.len}
