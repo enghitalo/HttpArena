@@ -84,24 +84,25 @@ fn ws(mut out []u8, s string) {
 
 // wi appends the decimal digits of a non-negative integer to `out`, no
 // allocation (itoa into a stack scratch, emitted most-significant-first).
+// The digits are written into the scratch back-to-front and flushed with a
+// single `push_many` — single-element `<<` is several times slower than a bulk
+// copy on post-0.5.1 V (vlang/v#27468), and this path runs for every number.
 @[direct_array_access]
 fn wi(mut out []u8, n i64) {
+	mut tmp := [20]u8{}
 	if n == 0 {
-		out << u8(`0`)
+		tmp[0] = u8(`0`)
+		unsafe { out.push_many(&tmp[0], 1) }
 		return
 	}
 	mut x := n
-	mut tmp := [20]u8{}
-	mut i := 0
+	mut i := 20
 	for x > 0 {
+		i--
 		tmp[i] = u8(`0`) + u8(x % 10)
 		x /= 10
-		i++
 	}
-	for i > 0 {
-		i--
-		out << tmp[i]
-	}
+	unsafe { out.push_many(&tmp[i], 20 - i) }
 }
 
 // write_resp appends a complete HTTP/1.1 response (status line + headers + body)
@@ -315,16 +316,15 @@ fn (sh &Shared) write_json_response(mut out []u8, count int, m i64) {
 	wi(mut out, i64(clen))
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"items":[')
 	for i in 0 .. count {
-		if i > 0 {
-			out << `,`
-		}
 		ws(mut out, sh.prefixes[i])
 		wi(mut out, sh.dataset[i].price * sh.dataset[i].quantity * m)
-		out << `}`
+		// fuse each object's closing `}` with the item separator `,` into one
+		// bulk write — single-element `<<` is the slow path on post-0.5.1 V.
+		ws(mut out, if i < count - 1 { '},' } else { '}' })
 	}
 	ws(mut out, '],"count":')
 	wi(mut out, i64(count))
-	out << `}`
+	ws(mut out, '}')
 }
 
 // write_json_gzip is the json-comp path. The gzipped response for a given
