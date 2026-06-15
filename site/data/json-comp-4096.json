@@ -1058,5 +1058,25 @@
     "status_3xx": 0,
     "status_4xx": 0,
     "status_5xx": 0
+  },
+  {
+    "framework": "vanilla-io_uring",
+    "language": "V",
+    "rps": 990800,
+    "avg_latency": "4.04ms",
+    "p99_latency": "104.10ms",
+    "cpu": "2357.9%",
+    "memory": "1.3GiB",
+    "connections": 4096,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "1.26GB/s",
+    "input_bw": "73.70MB/s",
+    "reconnects": 196982,
+    "status_2xx": 4954002,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
   }
 ]

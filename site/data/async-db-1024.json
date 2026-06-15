@@ -1094,6 +1094,26 @@
     "status_5xx": 0
   },
   {
+    "framework": "vanilla-io_uring",
+    "language": "V",
+    "rps": 10316,
+    "avg_latency": "98.10ms",
+    "p99_latency": "597.20ms",
+    "cpu": "515.4%",
+    "memory": "1.3GiB",
+    "connections": 1024,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "39.64MB/s",
+    "input_bw": "705.20KB/s",
+    "reconnects": 3717,
+    "status_2xx": 103166,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "veb",
     "language": "V",
     "rps": 3408,
