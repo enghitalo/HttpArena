@@ -131,7 +131,7 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 	if route == '/pipeline' {
 		write_resp(mut out, 'text/plain', 'ok')
 	} else if route == '/baseline11' {
-		mut sum := qint(req, 'a') + qint(req, 'b')
+		mut sum := qint(req, qk_a) + qint(req, qk_b)
 		if method == 'POST' {
 			sum += body_int(req)
 		}
@@ -139,8 +139,8 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 	} else if route == '/upload' {
 		write_resp(mut out, 'text/plain', req.body.len.str())
 	} else if route.starts_with('/json/') {
-		count := clamp_count(route[6..].i64(), sh.dataset.len)
-		mut m := qint(req, 'm')
+		count := clamp_count(parse_u_at(route, 6), sh.dataset.len)
+		mut m := qint(req, qk_m)
 		if m == 0 {
 			m = 1
 		}
@@ -151,8 +151,8 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 			sh.write_json_response(mut out, count, m)
 		}
 	} else if route == '/async-db' {
-		write_resp(mut out, 'application/json', sh.async_db(qint(req, 'min'), qint(req, 'max'),
-			qint(req, 'limit')))
+		write_resp(mut out, 'application/json', sh.async_db(qint(req, qk_min), qint(req, qk_max),
+			qint(req, qk_limit)))
 	} else if route == '/fortunes' {
 		write_resp(mut out, 'text/html; charset=utf-8', sh.fortunes())
 	} else if route.starts_with('/static/') {
@@ -165,10 +165,10 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 		if method == 'POST' {
 			out << sh.crud_create(req)
 		} else {
-			out << sh.crud_list(qstr(req, 'category'), qint(req, 'page'), qint(req, 'limit'))
+			out << sh.crud_list(qstr(req, qk_category), qint(req, qk_page), qint(req, qk_limit))
 		}
 	} else if route.starts_with('/crud/items/') {
-		id := route[12..].int()
+		id := int(parse_u_at(route, 12))
 		if method == 'PUT' {
 			out << sh.crud_update(id, req)
 		} else {
@@ -475,17 +475,47 @@ fn nn3(v ?string, d string) string {
 	return v or { d }
 }
 
-// qint reads a query parameter as an integer (0 if absent / non-numeric).
-fn qint(req request_parser.HttpRequest, key string) i64 {
-	s := req.get_query_slice(key.bytes()) or { return 0 }
+// Precomputed query-parameter key bytes, built once at init. The hot path then
+// never allocates a []u8 per lookup — `key.bytes()` did, one alloc per request
+// per parameter (baseline parses a+b, async-db min+max+limit, etc.).
+const qk_a = 'a'.bytes()
+const qk_b = 'b'.bytes()
+const qk_m = 'm'.bytes()
+const qk_min = 'min'.bytes()
+const qk_max = 'max'.bytes()
+const qk_limit = 'limit'.bytes()
+const qk_page = 'page'.bytes()
+const qk_category = 'category'.bytes()
+
+// qint reads a query parameter as an integer (0 if absent / non-numeric). The
+// key is a precomputed []u8 (qk_*) so there is no per-call allocation; the value
+// is read as a zero-copy tos() view and parsed in place.
+fn qint(req request_parser.HttpRequest, key []u8) i64 {
+	s := req.get_query_slice(key) or { return 0 }
 	return unsafe { tos(&req.buffer[s.start], s.len) }.i64()
 }
 
 // qstr reads a query parameter as a string ('' if absent). Clones so the value
 // outlives the request buffer (it is passed to the DB driver).
-fn qstr(req request_parser.HttpRequest, key string) string {
-	s := req.get_query_slice(key.bytes()) or { return '' }
+fn qstr(req request_parser.HttpRequest, key []u8) string {
+	s := req.get_query_slice(key) or { return '' }
 	return unsafe { tos(&req.buffer[s.start], s.len) }.clone()
+}
+
+// parse_u_at parses a non-negative integer from `s` starting at byte `start`,
+// stopping at the first non-digit — no substring allocation (route[6..].i64()
+// copies). Used to read the count / id embedded in the request path.
+@[direct_array_access]
+fn parse_u_at(s string, start int) i64 {
+	mut n := i64(0)
+	for i := start; i < s.len; i++ {
+		c := s[i]
+		if c < `0` || c > `9` {
+			break
+		}
+		n = n * 10 + i64(c - `0`)
+	}
+	return n
 }
 
 fn clamp_count(n i64, max int) int {
