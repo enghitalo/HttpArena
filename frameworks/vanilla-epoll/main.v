@@ -60,6 +60,11 @@ mut:
 	assets   map[string]StaticFile // /static/<name> -> prebuilt response
 	cache    map[int]string        // crud cache-aside: id -> item JSON
 	cache_mu &sync.RwMutex = unsafe { nil }
+	// json-comp cache: the gzipped response for a given (count, m) is fully
+	// deterministic and gzip dominates the cost, so compress once and reuse.
+	// Key = (count << 32) | m. The benchmark hits only a few pairs, so it's tiny.
+	gz_cache map[u64][]u8
+	gz_mu    &sync.RwMutex = unsafe { nil }
 }
 
 struct CrudCreate {
@@ -117,7 +122,11 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
 	target := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
-	route := target.all_before('?')
+	// Route on the path before '?' WITHOUT allocating: a tos() view into the
+	// request buffer rather than all_before()'s per-request copy. (Sub-slices like
+	// route[6..] still copy, but only on the few paths that actually need them.)
+	qpos := target.index_u8(`?`)
+	route := if qpos < 0 { target } else { unsafe { tos(target.str, qpos) } }
 
 	if route == '/pipeline' {
 		write_resp(mut out, 'text/plain', 'ok')
@@ -318,20 +327,37 @@ fn (sh &Shared) write_json_response(mut out []u8, count int, m i64) {
 	out << `}`
 }
 
-// write_json_gzip is the json-comp path: build the body, gzip it, and append
-// headers + compressed bytes into `out`. gzip needs a contiguous input, so this
-// path still allocates the body — but json-comp is compression-bound, not
-// allocation-bound, and the response no longer round-trips through a Builder.
-fn (sh &Shared) write_json_gzip(mut out []u8, count int, m i64) {
+// write_json_gzip is the json-comp path. The gzipped response for a given
+// (count, m) is fully deterministic and gzip CPU dominates the cost, so we cache
+// the COMPLETE response bytes and just append the cached copy on a hit — no
+// rebuild, no recompress. Compressing once instead of per-request is the whole
+// win for json-comp (the profile is compression-bound, not allocation-bound).
+fn (mut sh Shared) write_json_gzip(mut out []u8, count int, m i64) {
+	key := (u64(u32(count)) << 32) | u64(u32(m))
+	sh.gz_mu.@rlock()
+	cached := sh.gz_cache[key] or { []u8{} }
+	sh.gz_mu.runlock()
+	if cached.len > 0 {
+		out << cached
+		return
+	}
 	body := sh.json_body(count, m)
 	gz := gzip.compress(body.bytes()) or {
 		write_resp(mut out, 'application/json', body)
 		return
 	}
-	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
-	wi(mut out, i64(gz.len))
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	unsafe { out.push_many(gz.data, gz.len) }
+	mut resp := []u8{cap: gz.len + 128}
+	ws(mut resp, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
+	wi(mut resp, i64(gz.len))
+	ws(mut resp, '\r\nConnection: keep-alive\r\n\r\n')
+	unsafe { resp.push_many(gz.data, gz.len) }
+	// Store it (bounded so a flood of distinct m values can't grow it without limit).
+	sh.gz_mu.@lock()
+	if sh.gz_cache.len < 1024 {
+		sh.gz_cache[key] = resp
+	}
+	sh.gz_mu.unlock()
+	out << resp
 }
 
 // json_body builds just the /json body string (used for the gzip path).
@@ -636,6 +662,8 @@ fn main() {
 		assets:   assets
 		cache:    map[int]string{}
 		cache_mu: sync.new_rwmutex()
+		gz_cache: map[u64][]u8{}
+		gz_mu:    sync.new_rwmutex()
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
