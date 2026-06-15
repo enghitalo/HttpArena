@@ -63,7 +63,6 @@
     "language": "Java",
     "rps": 850405,
     "avg_latency": "29.44ms",
-    "p99_latency": "29.44ms",
     "cpu": "6111.4%",
     "memory": "24.9GiB",
     "connections": 256,

@@ -268,7 +268,7 @@ fi
 
 # ───── Helpers ─────
 
-DOCS_BASE="https://www.http-arena.com/docs/test-profiles"
+DOCS_BASE="https://www.http-arena.com/#doc=test-profiles"
 
 fail_with_link() {
     local msg="$1"
@@ -1464,7 +1464,7 @@ print(f'{count} {has_rating} {has_tags} {has_active_bool}')
 if has_test "gateway-64"; then
     _validate_gateway "gateway-64" \
         "$ROOT_DIR/frameworks/$FRAMEWORK/compose.gateway.yml" \
-        "$DOCS_BASE/h2-gateway/gateway-64/validation"
+        "$DOCS_BASE/gateway/gateway-h2/validation"
 fi
 
 # ───── Gateway H3 (h3/QUIC at the edge) ─────
@@ -1472,7 +1472,7 @@ fi
 if has_test "gateway-h3"; then
     _validate_gateway "gateway-h3" \
         "$ROOT_DIR/frameworks/$FRAMEWORK/compose.gateway-h3.yml" \
-        "$DOCS_BASE/h3-gateway/gateway-h3/validation"
+        "$DOCS_BASE/gateway/gateway-h3/validation"
 fi
 
 # ───── Production-stack (edge + authsvc + cache + server) ─────
@@ -1694,7 +1694,7 @@ print(f'{count} {valid} {correct_totals}')
 if has_test "production-stack"; then
     _validate_production_stack \
         "$ROOT_DIR/frameworks/$FRAMEWORK/compose.production-stack.yml" \
-        "$DOCS_BASE/production-stack/validation"
+        "$DOCS_BASE/gateway/production-stack/validation"
 fi
 
 # ───── Summary ─────

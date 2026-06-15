@@ -121,6 +121,14 @@
     "type": "engine",
     "engine": "libev"
   },
+  "blackbull": {
+    "dir": "blackbull",
+    "description": "BlackBull \u2014 pure-Python async ASGI 3.0 framework supporting HTTP/1.1, HTTP/2, and WebSocket. ALPN negotiates HTTP/2 on the same listener that serves HTTP/1.1.",
+    "repo": "https://github.com/TOKUJI/BlackBull",
+    "type": "emerging",
+    "engine": "blackbull",
+    "mode": "standard"
+  },
   "bottle": {
     "dir": "bottle",
     "description": "Fast, simple and lightweight WSGI micro web-framework for Python",
@@ -178,7 +186,7 @@
     "dir": "effinitive",
     "description": "Ultra-high-performance custom HTTP server for .NET 10 \u2014 built from scratch for maximum speed.",
     "repo": "https://github.com/HBartosch/Effinitive",
-    "type": "emerging",
+    "type": "experimental",
     "engine": "effinitive",
     "mode": "standard"
   },
@@ -354,6 +362,13 @@
     "engine": "n\u00edma",
     "mode": "tuned"
   },
+  "hical": {
+    "dir": "hical",
+    "description": "Hical is a modern C++20/26 high-performance web framework built on Boost.Asio, featuring coroutine-based async I/O (boost::asio::awaitable<T>), three-tier PMR memory pools, zero-copy HTTP parsing via picohttpparser, and a self-developed WebSocket stack (RFC 6455 with permessage-deflate). SO_REUSEPORT multi-acceptor model on Linux. Dual-track C++26 reflection layer (P2996 / C++20 macro fallback).",
+    "repo": "https://github.com/Hical61/Hical",
+    "type": "engine",
+    "engine": "hical"
+  },
   "hono-bun": {
     "dir": "hono-bun",
     "description": "Ultrafast Web Standards framework running natively on Bun \u2014 no adapter overhead.",
@@ -493,7 +508,7 @@
     "dir": "pyronova",
     "description": "Pyronova \u2014 Python web framework with a Rust core (hyper + tokio + rustls + mimalloc) and PEP 684 sub-interpreter workers for true multi-core parallelism. Opt-in features: gzip/brotli compression, rustls TLS with h2/h1 ALPN, streaming body ingest, async Postgres via sqlx::PgPool. Handlers are standard Python functions routed via decorators.",
     "repo": "https://github.com/leocaolab/pyronova",
-    "type": "emerging",
+    "type": "experimental",
     "engine": "pyronova",
     "mode": "tuned"
   },
@@ -672,7 +687,7 @@
   },
   "swerver": {
     "dir": "swerver",
-    "description": "Single-threaded event loop per worker with SO_REUSEPORT fork fan-out, native HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC), kqueue/epoll/io_uring backends.",
+    "description": "swerver as an engine: no pre-computed response bodies (pre-encoded registry off), JSON serialized per request through the framework's std.json-based ctx.jsonValue, static files served from an in-memory cache with precompressed .br/.gz negotiation, and the native async PostgreSQL client (pipelined, prepared-statement cache, park/resume) for async-db and fortunes. Single-threaded event loop per worker, SO_REUSEPORT fork fan-out, one multi-listener process for the four protocol ports, native HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC), kqueue/epoll/io_uring backends.",
     "repo": "https://github.com/justinGrosvenor/swerver",
     "type": "engine",
     "engine": "swerver"

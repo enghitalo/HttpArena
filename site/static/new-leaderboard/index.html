@@ -46,8 +46,9 @@
   a{color:inherit;text-decoration:none}
 
   .top{position:sticky; top:0; z-index:40; display:flex; align-items:center; gap:1.1rem; flex-wrap:wrap; row-gap:.5rem; padding:.72rem 1.5rem; background:var(--header-bg); backdrop-filter:blur(14px) saturate(1.6); -webkit-backdrop-filter:blur(14px) saturate(1.6); border-bottom:1px solid var(--line); box-shadow:0 6px 20px -12px rgba(20,22,40,.25)}
-  .brand{white-space:nowrap; width:calc(264px - .85rem)}  /* span the sidebar so the type filter aligns with the content column */
-  .brand-name{font-weight:750; font-size:1.06rem; letter-spacing:-.02em; color:var(--text)}
+  .brand{white-space:nowrap; width:calc(264px - .85rem); display:flex; align-items:center; gap:.55rem}  /* spans the sidebar width (type filter aligns with the content column); holds the home link + Timeline/RFC */
+  .brand-name{font-weight:750; font-size:1.06rem; letter-spacing:-.02em; color:var(--text); text-decoration:none; cursor:pointer; flex:none}
+  .brand-name:hover{opacity:.82}
   .brand-name b{color:var(--accent)}
   .round{position:relative; flex:none}
   .round-btn{display:flex; align-items:center; gap:.5rem; background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:.28rem .55rem; cursor:pointer; font:inherit; color:var(--text); transition:border-color .12s ease}
@@ -76,10 +77,12 @@
   .type-filter button.on{box-shadow:var(--shadow)}
   .type-filter button[data-type="flagship"].on{background:rgba(46,158,106,.15); color:#1b7a4e}
   .type-filter button[data-type="emerging"].on{background:rgba(59,115,196,.16); color:#2b5694}
+  .type-filter button[data-type="experimental"].on{background:rgba(217,142,43,.16); color:#8a5a12}
   .type-filter button[data-type="engine"].on{background:rgba(203,95,81,.15); color:#b0463a}
   .type-filter button[data-type="infrastructure"].on{background:rgba(47,147,168,.18); color:#277482}
   html[data-theme="dark"] .type-filter button[data-type="flagship"].on{background:rgba(46,158,106,.24); color:#5cc596}
   html[data-theme="dark"] .type-filter button[data-type="emerging"].on{background:rgba(59,115,196,.30); color:#9bbdec}
+  html[data-theme="dark"] .type-filter button[data-type="experimental"].on{background:rgba(217,142,43,.28); color:#e8b066}
   html[data-theme="dark"] .type-filter button[data-type="engine"].on{background:rgba(203,95,81,.24); color:#e89384}
   html[data-theme="dark"] .type-filter button[data-type="infrastructure"].on{background:rgba(47,147,168,.24); color:#6cc3d2}
 
@@ -109,6 +112,7 @@
 
   .nav-grp-h{display:flex; align-items:center; justify-content:space-between; gap:.4rem; padding:.44rem .55rem; border-radius:7px; cursor:pointer; color:var(--text); font-weight:650; font-size:.86rem; user-select:none}
   .nav-grp-h:hover{background:var(--panel-2)}
+  .nav-grp-h.active{background:var(--panel-2); box-shadow:inset 2px 0 0 var(--text-2)}
   .nav-grp-t{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
   .nav-ico{display:inline-flex; align-items:center; justify-content:center; flex:none; color:var(--muted); transition:color .12s ease}
   .nav-ico svg{width:15px; height:15px}
@@ -240,13 +244,14 @@
   .badge{font-size:.6rem; font-weight:700; letter-spacing:.04em; text-transform:uppercase; padding:.1rem .34rem; border-radius:5px; white-space:nowrap; flex:none}
   /* type as a small colored square (no label) in tables; fixed lang slot keeps names aligned. .badge stays for the modal */
   .tsq{width:10px; height:10px; border-radius:3px; flex:none; display:inline-block}
-  .tsq-flagship{background:#2e9e6a} .tsq-emerging{background:#3b73c4} .tsq-engine{background:#cb5f51} .tsq-infrastructure{background:#2f93a8}
+  .tsq-flagship{background:#2e9e6a} .tsq-emerging{background:#3b73c4} .tsq-experimental{background:#d98e2b} .tsq-engine{background:#cb5f51} .tsq-infrastructure{background:#2f93a8}
   /* 'tuned' mode cue - yellow ring around the type square / badge */
   .tsq.tuned, .badge.tuned{position:relative}
   .tsq.tuned::after, .badge.tuned::after{content:""; position:absolute; top:0; bottom:0; right:calc(100% + 2px); width:4px; background:#c89a3c}
   .fw .lang, .cm .fwcell .lang{width:3rem; flex:none; overflow:hidden; text-overflow:ellipsis}
   .b-flagship{background:rgba(46,158,106,.13); color:#1b7a4e} html[data-theme="dark"] .b-flagship{color:#5cc596}
   .b-emerging{background:rgba(59,115,196,.14); color:#2b5694} html[data-theme="dark"] .b-emerging{color:#9bbdec}
+  .b-experimental{background:rgba(217,142,43,.14); color:#8a5a12} html[data-theme="dark"] .b-experimental{color:#e8b066}
   .b-engine{background:rgba(203,95,81,.13); color:#b0463a} html[data-theme="dark"] .b-engine{color:#e89384}
   .b-infrastructure{background:rgba(47,147,168,.14); color:#277482} html[data-theme="dark"] .b-infrastructure{color:#6cc3d2}
 
@@ -381,10 +386,16 @@
 </head>
 <body>
   <header class="top">
-    <div class="brand"><span class="brand-name"><b>Http</b>Arena</span></div>
+    <div class="brand">
+      <a class="brand-name" href="#" id="brandHome" aria-label="HttpArena home"><b>Http</b>Arena</a>
+      <a class="icon-btn" href="https://timeline.http-arena.com" target="_blank" rel="noopener" title="Timeline" aria-label="Timeline"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></a>
+      <a class="icon-btn" href="https://mda2av.github.io/Http11Probe/" target="_blank" rel="noopener" title="RFC Compliance" aria-label="RFC Compliance"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></a>
+    </div>
     <div class="type-filter" id="typeFilter">
       <button data-type="flagship" data-tip="Mature framework with an active development team, a solid ecosystem, and an established community around it; covers a complete test category.">Flagship</button>
       <button data-type="emerging" data-tip="A real framework that doesn’t yet meet the full flagship bar - younger, minimal, or partial coverage.">Emerging</button>
+      <button data-type="experimental" data-tip="Very new, unproven work. Ranked with frameworks but hidden until you select it.">Experimental</button>
+      <span class="tf-div" aria-hidden="true"></span>
       <button data-type="engine" data-tip="Bare-metal HTTP implementation (raw sockets / low-level I/O). Ranked separately.">Engine</button>
       <button data-type="infrastructure" data-tip="Reverse proxies and static-file servers (e.g. nginx, h2o).">Infra</button>
       <span class="tf-div" aria-hidden="true"></span>
@@ -393,7 +404,6 @@
     <div class="round" id="round"></div>
     <div class="hw" id="hw"></div>
     <div class="top-links">
-      <a class="icon-btn" href="https://timeline.http-arena.com" target="_blank" rel="noopener" title="Timeline" aria-label="Timeline"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></a>
       <a class="icon-btn" href="https://github.com/MDA2AV/HttpArena" target="_blank" rel="noopener" title="GitHub" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222 0 1.606-.014 2.898-.014 3.293 0 .322.216.694.825.576C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg></a>
       <a class="icon-btn" href="https://discord.gg/H84B5ZqDXR" target="_blank" rel="noopener" title="Discord" aria-label="Discord"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z"/></svg></a>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
@@ -481,10 +491,11 @@
     if(pos.length && !pos.some(hit)) return false;
     return true;
   }
-  function typeAbbr(t){ return {flagship:'flagship', emerging:'emerging', engine:'engine', infrastructure:'infra'}[t] || t; }
+  function typeAbbr(t){ return {flagship:'flagship', emerging:'emerging', experimental:'experimental', engine:'engine', infrastructure:'infra'}[t] || t; }
   var TYPE_TIP={
     flagship:'Flagship - mature framework with an active development team, a solid ecosystem, and an established community around it; covers a complete test category.',
     emerging:'Emerging - a real framework that doesn’t yet meet the full flagship bar (younger, minimal, or partial coverage).',
+    experimental:'Experimental - very new, unproven work. Ranked with frameworks but hidden until selected.',
     engine:'Engine - bare-metal HTTP implementation (raw sockets / low-level I/O). Ranked separately.',
     infrastructure:'Infrastructure - reverse proxies and static-file servers (e.g. nginx, h2o).'
   };
@@ -615,9 +626,17 @@
   function docsGroup(node){
     var isRoot=node.u==='';
     var grp=document.createElement('div'); grp.className='nav-grp'+(isRoot?' lvl0':'')+(expanded.has(node.u)?' open':'');
-    var gh=document.createElement('div'); gh.className='nav-grp-h';
+    var gh=document.createElement('div'); gh.className='nav-grp-h'+(!isRoot&&state.view==='doc'&&state.doc===node.u?' active':'');
     gh.innerHTML=(isRoot?navIco('kb')+'<span class="nav-grp-t">'+esc(node.t)+'</span>':'<span>'+esc(node.t)+'</span>')+'<span class="caret">▸</span>';
-    gh.onclick=function(){ toggleGrp(grp,node.u); };
+    // Clicking a section opens it and shows its overview page (the _index content, e.g. Test Profiles'
+    // API Specification); clicking again (when open) collapses it. Root + content-less sections just toggle.
+    gh.onclick=function(){
+      // navigate to the section's overview page unless we're already on it (then toggle).
+      // covers: collapsed -> open + show; expanded-but-elsewhere -> show (stay open); on-page -> collapse.
+      var onPage=(state.view==='doc' && state.doc===node.u);
+      if(!isRoot && !onPage && LB_DOCS && LB_DOCS[node.u]!==undefined){ pickDoc(node.u); }
+      else { toggleGrp(grp,node.u); }
+    };
     grp.appendChild(gh);
     var body=navBody();
     node.c.forEach(function(ch){ body.firstChild.appendChild(ch.c&&ch.c.length ? docsGroup(ch) : docsLeaf(ch)); });
@@ -1120,7 +1139,8 @@
     var chips=[];
     if(c.cpu) chips.push('<span class="chip"><b>'+(c.cores||'')+'</b> cores · '+esc(shortCpu(c.cpu))+'</span>');
     if(c.ram) chips.push('<span class="chip"><b>'+esc(c.ram)+'</b> RAM</span>');
-    if(c.os) chips.push('<span class="chip">'+esc(c.os)+'</span>');
+    if(c.kernel) chips.push('<span class="chip">Linux '+esc(c.kernel)+'</span>');
+    else if(c.os) chips.push('<span class="chip">'+esc(c.os)+'</span>');
     document.getElementById('hw').innerHTML=chips.join('');
   }
 
@@ -1137,12 +1157,13 @@
     if(e.target.closest('a')) return;
     var row=e.target.closest('[data-fw-row]'); if(row) openModal(row.getAttribute('data-fw-row'));
   });
-  try{ var _vt=['flagship','emerging','engine','infrastructure']; var _t=JSON.parse(localStorage.getItem('lb-types')||'null'); if(_t&&_t.length){ _t=_t.filter(function(x){return _vt.indexOf(x)>=0;}); if(_t.length) state.types=_t; } }catch(e){}
+  try{ var _vt=['flagship','emerging','experimental','engine','infrastructure']; var _t=JSON.parse(localStorage.getItem('lb-types')||'null'); if(_t&&_t.length){ _t=_t.filter(function(x){return _vt.indexOf(x)>=0;}); if(_t.length) state.types=_t; } }catch(e){}
   document.getElementById('typeFilter').addEventListener('click', function(e){ var b=e.target.closest('button[data-type]'); if(!b) return; toggleType(b.getAttribute('data-type')); });
   try{ var _st=localStorage.getItem('lb-showtuned'); if(_st!==null) state.showTuned=_st==='1'; }catch(e){}
   document.getElementById('tunedToggle').addEventListener('click', function(){ state.showTuned=!state.showTuned; saveTuned(); render(); });
   restoreFromHash();
   initTips(); initModal(); initDocLinks(); initSearchHelp(); initRounds(); initTheme(); hw(); buildNav(); renderHead(); render();
+  (function(){ var b=document.getElementById('brandHome'); if(b) b.onclick=function(e){ e.preventDefault(); pickScope('h1'); }; })();
   window.addEventListener('hashchange', function(){ restoreFromHash(); buildNav(); renderHead(); render(); });
   var _rz; window.addEventListener('resize', function(){ clearTimeout(_rz); _rz=setTimeout(function(){ if(state.view==='profile') render(); else if(state.view==='composite') syncTopScroll(); }, 150); });
 })();
