@@ -145,7 +145,13 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 		}
 		write_resp(mut out, 'text/plain', sum.str())
 	} else if route == '/upload' {
-		write_resp(mut out, 'text/plain', req.body.len.str())
+		// Answer by Content-Length: the engine streams (drains) large bodies
+		// instead of buffering them, so req.body may be empty — but the declared
+		// length is what the upload profile asks for. Falls back to the buffered
+		// body length when no Content-Length is present (small/bufferable bodies).
+		cl := req.content_length()
+		n := if cl >= 0 { i64(cl) } else { i64(req.body.len) }
+		write_resp(mut out, 'text/plain', n.str())
 	} else if route.starts_with('/json/') {
 		count := clamp_count(parse_u_at(route, 6), sh.dataset.len)
 		mut m := qint(req, qk_m)
