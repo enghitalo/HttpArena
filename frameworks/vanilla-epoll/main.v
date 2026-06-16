@@ -2,6 +2,7 @@ module main
 
 import vanilla.http_server
 import vanilla.http_server.http1_1.request_parser
+import vanilla.http_server.core
 import db.pg
 import json
 import os
@@ -47,10 +48,16 @@ struct Fortune {
 	message string
 }
 
-// A static asset preloaded into memory with its full HTTP response.
+// A static asset served with sendfile(2): the response head is precomputed, the
+// body is streamed zero-copy straight from the page-cached file fd (no per-request
+// copy into the write buffer, so write_buf never grows into a big scanned block).
 struct StaticFile {
-	response []u8
+	header []u8 // precomputed status line + headers (Content-Length = size)
+	fd     int  // borrowed O_RDONLY fd, shared across conns (sendfile uses an explicit offset)
+	size   i64
 }
+
+fn C.open(pathname &char, flags int) int
 
 struct Shared {
 mut:
@@ -158,7 +165,9 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 		write_resp(mut out, 'text/html; charset=utf-8', sh.fortunes())
 	} else if route.starts_with('/static/') {
 		if f := sh.assets[route[8..]] {
-			out << f.response
+			// Head into write_buf, body via sendfile(2) — zero userspace copy.
+			out << f.header
+			core.queue_file(f.fd, 0, f.size)
 		} else {
 			out << not_found
 		}
@@ -714,9 +723,18 @@ fn main() {
 		if name.ends_with('.gz') || name.ends_with('.br') {
 			continue
 		}
-		bytes := os.read_bytes('${static_dir}/${name}') or { continue }
+		path := '${static_dir}/${name}'
+		fsize := i64(os.file_size(path))
+		// Open once, keep the fd for the server's life (borrowed; sendfile reads
+		// from the page cache with an explicit offset, so the fd is shared safely).
+		fd := C.open(&char(path.str), 0) // O_RDONLY
+		if fd < 0 {
+			continue
+		}
 		assets[name] = StaticFile{
-			response: static_response(content_type(name), bytes)
+			header: static_header(content_type(name), fsize)
+			fd:     fd
+			size:   fsize
 		}
 	}
 
@@ -744,14 +762,16 @@ fn main() {
 	server.run()
 }
 
-// static_response prebuilds the full HTTP response for a static file.
-fn static_response(ctype string, body []u8) []u8 {
-	mut sb := strings.new_builder(body.len + 96)
+// static_header prebuilds the HTTP response head (status line + headers) for a
+// static file. The body is streamed separately, zero-copy, with sendfile(2) via
+// core.queue_file — so the body never gets copied into the per-connection write
+// buffer (which would grow into a large scanned GC block, the static "cliff").
+fn static_header(ctype string, size i64) []u8 {
+	mut sb := strings.new_builder(96)
 	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
 	sb.write_string(ctype)
 	sb.write_string('\r\nContent-Length: ')
-	sb.write_decimal(i64(body.len))
+	sb.write_decimal(size)
 	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	unsafe { sb.write_ptr(body.data, body.len) }
 	return sb
 }
