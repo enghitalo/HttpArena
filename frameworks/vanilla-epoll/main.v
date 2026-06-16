@@ -89,6 +89,15 @@ fn ws(mut out []u8, s string) {
 	unsafe { out.push_many(s.str, s.len) }
 }
 
+// wb appends a byte slice to `out` as one bulk push_many — the regression-safe
+// equivalent of `out << bytes` (uniform with ws/wi; never the per-element append
+// path `<<` can lower to on post-0.5.1 V, vlang/v#27468). Bit-shift `<<` (e.g.
+// the gz-cache key) is unrelated and stays as is.
+@[inline]
+fn wb(mut out []u8, b []u8) {
+	unsafe { out.push_many(b.data, b.len) }
+}
+
 // wi appends the decimal digits of a non-negative integer to `out`, no
 // allocation (itoa into a stack scratch, emitted most-significant-first).
 // The digits are written into the scratch back-to-front and flushed with a
@@ -172,26 +181,26 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 	} else if route.starts_with('/static/') {
 		if f := sh.assets[route[8..]] {
 			// Head into write_buf, body via sendfile(2) — zero userspace copy.
-			out << f.header
+			wb(mut out, f.header)
 			core.queue_file(f.fd, 0, f.size)
 		} else {
-			out << not_found
+			wb(mut out, not_found)
 		}
 	} else if route == '/crud/items' {
 		if method == 'POST' {
-			out << sh.crud_create(req)
+			wb(mut out, sh.crud_create(req))
 		} else {
-			out << sh.crud_list(qstr(req, qk_category), qint(req, qk_page), qint(req, qk_limit))
+			wb(mut out, sh.crud_list(qstr(req, qk_category), qint(req, qk_page), qint(req, qk_limit)))
 		}
 	} else if route.starts_with('/crud/items/') {
 		id := int(parse_u_at(route, 12))
 		if method == 'PUT' {
-			out << sh.crud_update(id, req)
+			wb(mut out, sh.crud_update(id, req))
 		} else {
-			out << sh.crud_get(id)
+			wb(mut out, sh.crud_get(id))
 		}
 	} else {
-		out << not_found
+		wb(mut out, not_found)
 	}
 }
 
@@ -353,7 +362,7 @@ fn (mut sh Shared) write_json_gzip(mut out []u8, count int, m i64) {
 	cached := sh.gz_cache[key] or { []u8{} }
 	sh.gz_mu.runlock()
 	if cached.len > 0 {
-		out << cached
+		wb(mut out, cached)
 		return
 	}
 	body := sh.json_body(count, m)
@@ -372,7 +381,7 @@ fn (mut sh Shared) write_json_gzip(mut out []u8, count int, m i64) {
 		sh.gz_cache[key] = resp
 	}
 	sh.gz_mu.unlock()
-	out << resp
+	wb(mut out, resp)
 }
 
 // json_body builds just the /json body string (used for the gzip path).
