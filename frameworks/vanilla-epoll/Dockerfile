@@ -25,6 +25,10 @@ RUN git clone --branch 0.5.1 --depth 1 https://github.com/vlang/v /opt/v && \
     ln -s /opt/v/v /usr/local/bin/v
 
 # Install the vanilla HTTP server as the `vanilla` module (import vanilla.http_server).
+# The ADD fetches vanilla's main ref first, so Docker invalidates this layer's
+# cache whenever main moves — otherwise the clone layer is cached indefinitely and
+# the build never picks up upstream library fixes.
+ADD https://api.github.com/repos/enghitalo/vanilla/git/refs/heads/main /tmp/vanilla-main-ref.json
 RUN git clone --depth 1 https://github.com/enghitalo/vanilla /root/.vmodules/vanilla
 
 WORKDIR /app
