@@ -6,7 +6,6 @@ import vanilla.http_server.core
 import vanilla.pg_async
 import json
 import os
-import runtime
 import strings
 import sync
 import compress.gzip
@@ -311,12 +310,22 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 
 fn (w &WorkerCtx) render_error(mut out []u8, kind u8) {
 	match kind {
-		k_async_db { write_resp(mut out, 'application/json', '{"items":[],"count":0}') }
-		k_fortunes { write_resp(mut out, 'text/html; charset=utf-8',
-				'<!doctype html><html><body><table></table></body></html>') }
-		k_crud_list { write_resp(mut out, 'application/json', '{"items":[],"total":0,"page":1}') }
-		k_crud_get { wb(mut out, not_found) }
-		else { wb(mut out, bad_request) }
+		k_async_db {
+			write_resp(mut out, 'application/json', '{"items":[],"count":0}')
+		}
+		k_fortunes {
+			write_resp(mut out, 'text/html; charset=utf-8',
+				'<!doctype html><html><body><table></table></body></html>')
+		}
+		k_crud_list {
+			write_resp(mut out, 'application/json', '{"items":[],"total":0,"page":1}')
+		}
+		k_crud_get {
+			wb(mut out, not_found)
+		}
+		else {
+			wb(mut out, bad_request)
+		}
 	}
 }
 
@@ -796,7 +805,10 @@ fn main() {
 	if total < 1 {
 		total = 64
 	}
-	workers := runtime.nr_cpus()
+	// Use the cpuset-aware worker count (core.max_thread_pool_size) — matches how
+	// many worker threads the engine actually spawns — so the per-worker pool size
+	// is computed against real usable cores, not the host CPU count.
+	workers := core.max_thread_pool_size
 	mut per_worker := total / workers
 	if per_worker < 1 {
 		per_worker = 1
