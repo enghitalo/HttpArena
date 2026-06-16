@@ -8,6 +8,7 @@ import json
 import os
 import runtime
 import strings
+import sync
 import compress.gzip
 
 struct Rating {
@@ -50,24 +51,29 @@ struct Fortune {
 	message string
 }
 
-// SharedRO is the immutable, process-wide data: the dataset, the precomputed
-// per-item JSON prefixes, and the preloaded static assets. Shared by reference
-// across all workers (read-only, so no synchronization).
-struct SharedRO {
+// Shared is the process-wide state, shared by reference across all workers: the
+// read-only dataset/prefixes/assets, plus the crud cache-aside and json-comp
+// caches. The caches are SHARED (not per-worker) so the crud X-Cache MISS→HIT
+// contract holds regardless of which worker SO_REUSEPORT routes a request to;
+// they are guarded by RwMutexes since workers are separate threads.
+struct Shared {
 	dataset  []DatasetItem
 	prefixes []string
 	assets   map[string]StaticFile
+mut:
+	cache    map[int][]u8 // crud cache-aside: id -> full item response bytes
+	cache_mu &sync.RwMutex = unsafe { nil }
+	gz_cache map[u64][]u8 // json-comp: (count<<32)|m -> gzipped response bytes
+	gz_mu    &sync.RwMutex = unsafe { nil }
 }
 
 // WorkerCtx is the per-worker state handed to every handler call as ac.state
-// (the make_state contract). Each worker owns its own async Postgres pool and
-// its own caches — no cross-worker sharing, so no locks.
+// (the make_state contract). Each worker owns its own async Postgres pool;
+// `ro` points at the process-shared Shared.
 struct WorkerCtx {
 mut:
-	ro       &SharedRO = unsafe { nil }
-	pool     &pg_async.PgPool = unsafe { nil }
-	cache    map[int][]u8 // crud cache-aside: id -> full item response bytes
-	gz_cache map[u64][]u8 // json-comp: (count<<32)|m -> gzipped response bytes
+	ro   &Shared          = unsafe { nil }
+	pool &pg_async.PgPool = unsafe { nil }
 }
 
 // Stash is the per-request state that must survive across the park (the request
@@ -219,8 +225,8 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		}
 		return .done
 	} else if route == '/async-db' {
-		return w.start_async_db(mut out, mut ac, qint(req, qk_min), qint(req, qk_max),
-			qint(req, qk_limit))
+		return w.start_async_db(mut out, mut ac, qint(req, qk_min), qint(req, qk_max), qint(req,
+			qk_limit))
 	} else if route == '/fortunes' {
 		return w.start_fortunes(mut out, mut ac)
 	} else if route.starts_with('/static/') {
@@ -235,8 +241,8 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		if method == 'POST' {
 			return w.start_crud_create(mut out, mut ac, req)
 		}
-		return w.start_crud_list(mut out, mut ac, qstr(req, qk_category), qint(req, qk_page),
-			qint(req, qk_limit))
+		return w.start_crud_list(mut out, mut ac, qstr(req, qk_category), qint(req, qk_page), qint(req,
+			qk_limit))
 	} else if route.starts_with('/crud/items/') {
 		id := int(parse_u_at(route, 12))
 		if method == 'PUT' {
@@ -298,6 +304,7 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		k_crud_update { w.render_crud_update(mut out, st.id) }
 		else { wb(mut out, not_found) }
 	}
+
 	w.pool.release(st.conn_idx)
 	return .done
 }
@@ -305,7 +312,8 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 fn (w &WorkerCtx) render_error(mut out []u8, kind u8) {
 	match kind {
 		k_async_db { write_resp(mut out, 'application/json', '{"items":[],"count":0}') }
-		k_fortunes { write_resp(mut out, 'text/html; charset=utf-8', '<!doctype html><html><body><table></table></body></html>') }
+		k_fortunes { write_resp(mut out, 'text/html; charset=utf-8',
+				'<!doctype html><html><body><table></table></body></html>') }
 		k_crud_list { write_resp(mut out, 'application/json', '{"items":[],"total":0,"page":1}') }
 		k_crud_get { wb(mut out, not_found) }
 		else { wb(mut out, bad_request) }
@@ -325,7 +333,8 @@ fn (mut w WorkerCtx) start_async_db(mut out []u8, mut ac core.AsyncCtx, min i64,
 		lim = 50
 	}
 	params := [?[]u8(min.str().bytes()), ?[]u8(max.str().bytes()), ?[]u8(lim.str().bytes())]
-	return w.park(mut out, mut ac, async_db_sql, params, k_async_db, 0, 0, '{"items":[],"count":0}'.bytes())
+	return w.park(mut out, mut ac, async_db_sql, params, k_async_db, 0, 0,
+		'{"items":[],"count":0}'.bytes())
 }
 
 fn (w &WorkerCtx) render_async_db(mut out []u8, res pg_async.Result) {
@@ -376,8 +385,8 @@ fn render_item(mut body []u8, row pg_async.Row) {
 // ── /fortunes ────────────────────────────────────────────────────────────────
 
 fn (mut w WorkerCtx) start_fortunes(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	return w.park(mut out, mut ac, 'SELECT id, message FROM fortune', []?[]u8{}, k_fortunes,
-		0, 0, '<!doctype html><html><body><table></table></body></html>'.bytes())
+	return w.park(mut out, mut ac, 'SELECT id, message FROM fortune', []?[]u8{}, k_fortunes, 0, 0,
+		'<!doctype html><html><body><table></table></body></html>'.bytes())
 }
 
 fn render_fortunes(mut out []u8, res pg_async.Result) {
@@ -396,7 +405,8 @@ fn render_fortunes(mut out []u8, res pg_async.Result) {
 	}
 	fortunes.sort(a.message < b.message)
 	mut body := []u8{cap: 32768}
-	ws(mut body, '<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
+	ws(mut body,
+		'<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
 	for f in fortunes {
 		ws(mut body, '<tr><td>')
 		wi(mut body, i64(f.id))
@@ -428,7 +438,8 @@ fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, categor
 	}
 	offset := (p - 1) * lim
 	params := [?[]u8(category.bytes()), ?[]u8(lim.str().bytes()), ?[]u8(offset.str().bytes())]
-	return w.park(mut out, mut ac, crud_list_sql, params, k_crud_list, 0, p, '{"items":[],"total":0,"page":1}'.bytes())
+	return w.park(mut out, mut ac, crud_list_sql, params, k_crud_list, 0, p,
+		'{"items":[],"total":0,"page":1}'.bytes())
 }
 
 fn render_crud_list(mut out []u8, res pg_async.Result, page i64) {
@@ -455,16 +466,21 @@ fn render_crud_list(mut out []u8, res pg_async.Result, page i64) {
 }
 
 fn (mut w WorkerCtx) start_crud_get(mut out []u8, mut ac core.AsyncCtx, id int) core.AsyncStep {
-	if cached := w.cache[id] {
+	w.ro.cache_mu.@rlock()
+	cached := w.ro.cache[id] or { []u8{} }
+	w.ro.cache_mu.runlock()
+	if cached.len > 0 {
 		// Cache hit: answer synchronously, no DB round-trip.
-		ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
+		ws(mut out,
+			'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
 		wi(mut out, i64(cached.len))
 		ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
 		wb(mut out, cached)
 		return .done
 	}
 	params := [?[]u8(id.str().bytes())]
-	return w.park(mut out, mut ac, 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
+	return w.park(mut out, mut ac,
+		'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
 		params, k_crud_get, id, 0, not_found)
 }
 
@@ -476,8 +492,11 @@ fn (mut w WorkerCtx) render_crud_get(mut out []u8, res pg_async.Result, id int) 
 	}
 	mut item := []u8{cap: 512}
 	render_item(mut item, row)
-	w.cache[id] = item // populate the per-worker cache-aside
-	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: MISS\r\nContent-Type: application/json\r\nContent-Length: ')
+	w.ro.cache_mu.@lock()
+	w.ro.cache[id] = item // populate the shared cache-aside
+	w.ro.cache_mu.unlock()
+	ws(mut out,
+		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: MISS\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, i64(item.len))
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
 	wb(mut out, item)
@@ -491,7 +510,8 @@ fn (mut w WorkerCtx) start_crud_create(mut out []u8, mut ac core.AsyncCtx, req r
 	}
 	params := [?[]u8(c.id.str().bytes()), ?[]u8(c.name.bytes()), ?[]u8(c.category.bytes()),
 		?[]u8(c.price.str().bytes()), ?[]u8(c.quantity.str().bytes())]
-	return w.park(mut out, mut ac, "INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
+	return w.park(mut out, mut ac,
+		"INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
 		params, k_crud_create, 0, 0, bad_request)
 }
 
@@ -503,12 +523,15 @@ fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id in
 	}
 	params := [?[]u8(id.str().bytes()), ?[]u8(c.name.bytes()), ?[]u8(c.category.bytes()),
 		?[]u8(c.price.str().bytes()), ?[]u8(c.quantity.str().bytes())]
-	return w.park(mut out, mut ac, 'UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
+	return w.park(mut out, mut ac,
+		'UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
 		params, k_crud_update, id, 0, bad_request)
 }
 
 fn (mut w WorkerCtx) render_crud_update(mut out []u8, id int) {
-	w.cache.delete(id) // invalidate the cache-aside entry
+	w.ro.cache_mu.@lock()
+	w.ro.cache.delete(id) // invalidate the cache-aside entry
+	w.ro.cache_mu.unlock()
 	write_resp(mut out, 'application/json', '{"status":"ok"}')
 }
 
@@ -524,7 +547,8 @@ fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
 		t := w.ro.dataset[i].price * w.ro.dataset[i].quantity * m
 		clen += w.ro.prefixes[i].len + digits(t) + 1
 	}
-	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
+	ws(mut out,
+		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, i64(clen))
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"items":[')
 	for i in 0 .. count {
@@ -539,7 +563,10 @@ fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
 
 fn (mut w WorkerCtx) write_json_gzip(mut out []u8, count int, m i64) {
 	key := (u64(u32(count)) << 32) | u64(u32(m))
-	if cached := w.gz_cache[key] {
+	w.ro.gz_mu.@rlock()
+	cached := w.ro.gz_cache[key] or { []u8{} }
+	w.ro.gz_mu.runlock()
+	if cached.len > 0 {
 		wb(mut out, cached)
 		return
 	}
@@ -549,13 +576,16 @@ fn (mut w WorkerCtx) write_json_gzip(mut out []u8, count int, m i64) {
 		return
 	}
 	mut resp := []u8{cap: gz.len + 128}
-	ws(mut resp, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
+	ws(mut resp,
+		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut resp, i64(gz.len))
 	ws(mut resp, '\r\nConnection: keep-alive\r\n\r\n')
 	unsafe { resp.push_many(gz.data, gz.len) }
-	if w.gz_cache.len < 1024 {
-		w.gz_cache[key] = resp
+	w.ro.gz_mu.@lock()
+	if w.ro.gz_cache.len < 1024 {
+		w.ro.gz_cache[key] = resp
 	}
+	w.ro.gz_mu.unlock()
 	wb(mut out, resp)
 }
 
@@ -804,10 +834,14 @@ fn main() {
 		}
 	}
 
-	ro := &SharedRO{
+	ro := &Shared{
 		dataset:  dataset
 		prefixes: prefixes
 		assets:   assets
+		cache:    map[int][]u8{}
+		cache_mu: sync.new_rwmutex()
+		gz_cache: map[u64][]u8{}
+		gz_mu:    sync.new_rwmutex()
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
@@ -822,10 +856,8 @@ fn main() {
 				panic('vanilla-epoll: pg pool bring-up failed: ${err}')
 			}
 			w := &WorkerCtx{
-				ro:       ro
-				pool:     pool
-				cache:    map[int][]u8{}
-				gz_cache: map[u64][]u8{}
+				ro:   ro
+				pool: pool
 			}
 			return voidptr(w)
 		}
