@@ -3,7 +3,7 @@ module main
 import vanilla.http_server
 import vanilla.http_server.http1_1.request_parser
 import vanilla.http_server.core
-import vanilla.pg_async
+import db.pg
 import json
 import os
 import strings
@@ -27,15 +27,52 @@ struct DatasetItem {
 	rating   Rating
 }
 
+struct DbItem {
+	id       int
+	name     string
+	category string
+	price    int
+	quantity int
+	active   bool
+	tags     []string
+	rating   Rating
+}
+
+struct DbResp {
+	items []DbItem
+	count int
+}
+
+struct Fortune {
+	id      int
+	message string
+}
+
 // A static asset served with sendfile(2): the response head is precomputed, the
-// body is streamed zero-copy straight from the page-cached file fd.
+// body is streamed zero-copy straight from the page-cached file fd (no per-request
+// copy into the write buffer, so write_buf never grows into a big scanned block).
 struct StaticFile {
-	header []u8
-	fd     int
+	header []u8 // precomputed status line + headers (Content-Length = size)
+	fd     int  // borrowed O_RDONLY fd, shared across conns (sendfile uses an explicit offset)
 	size   i64
 }
 
 fn C.open(pathname &char, flags int) int
+
+struct Shared {
+mut:
+	pool     pg.ConnectionPool
+	dataset  []DatasetItem
+	prefixes []string // per item: `{…,"total":` (everything but the request-dependent total)
+	assets   map[string]StaticFile // /static/<name> -> prebuilt response
+	cache    map[int]string        // crud cache-aside: id -> item JSON
+	cache_mu &sync.RwMutex = unsafe { nil }
+	// json-comp cache: the gzipped response for a given (count, m) is fully
+	// deterministic and gzip dominates the cost, so compress once and reuse.
+	// Key = (count << 32) | m. The benchmark hits only a few pairs, so it's tiny.
+	gz_cache map[u64][]u8
+	gz_mu    &sync.RwMutex = unsafe { nil }
+}
 
 struct CrudCreate {
 	id       int
@@ -45,65 +82,27 @@ struct CrudCreate {
 	quantity int
 }
 
-struct Fortune {
-	id      int
-	message string
-}
-
-// Shared is the process-wide state, shared by reference across all workers: the
-// read-only dataset/prefixes/assets, plus the crud cache-aside and json-comp
-// caches. The caches are SHARED (not per-worker) so the crud X-Cache MISS→HIT
-// contract holds regardless of which worker SO_REUSEPORT routes a request to;
-// they are guarded by RwMutexes since workers are separate threads.
-struct Shared {
-	dataset  []DatasetItem
-	prefixes []string
-	assets   map[string]StaticFile
-mut:
-	cache    map[int][]u8 // crud cache-aside: id -> full item response bytes
-	cache_mu &sync.RwMutex = unsafe { nil }
-	gz_cache map[u64][]u8 // json-comp: (count<<32)|m -> gzipped response bytes
-	gz_mu    &sync.RwMutex = unsafe { nil }
-}
-
-// WorkerCtx is the per-worker state handed to every handler call as ac.state
-// (the make_state contract). Each worker owns its own async Postgres pool;
-// `ro` points at the process-shared Shared.
-struct WorkerCtx {
-mut:
-	ro   &Shared          = unsafe { nil }
-	pool &pg_async.PgPool = unsafe { nil }
-}
-
-// Stash is the per-request state that must survive across the park (the request
-// buffer is recycled while a query is in flight). One small heap struct per DB
-// request; the single resume continuation switches on `kind`.
-struct Stash {
-	kind     u8
-	conn_idx int
-	id       int
-	page     i64
-}
-
-const k_async_db = u8(1)
-const k_fortunes = u8(2)
-const k_crud_get = u8(3)
-const k_crud_list = u8(4)
-const k_crud_create = u8(5)
-const k_crud_update = u8(6)
-
-// ── zero-alloc write helpers (push_many, never single-element `<<`) ──────────
-
+// ws appends a string's bytes to `out` with no allocation (push_many copies
+// straight from the string's backing storage into the connection write buffer).
 @[inline]
 fn ws(mut out []u8, s string) {
 	unsafe { out.push_many(s.str, s.len) }
 }
 
+// wb appends a byte slice to `out` as one bulk push_many — the regression-safe
+// equivalent of `out << bytes` (uniform with ws/wi; never the per-element append
+// path `<<` can lower to on post-0.5.1 V, vlang/v#27468). Bit-shift `<<` (e.g.
+// the gz-cache key) is unrelated and stays as is.
 @[inline]
 fn wb(mut out []u8, b []u8) {
 	unsafe { out.push_many(b.data, b.len) }
 }
 
+// wi appends the decimal digits of a non-negative integer to `out`, no
+// allocation (itoa into a stack scratch, emitted most-significant-first).
+// The digits are written into the scratch back-to-front and flushed with a
+// single `push_many` — single-element `<<` is several times slower than a bulk
+// copy on post-0.5.1 V (vlang/v#27468), and this path runs for every number.
 @[direct_array_access]
 fn wi(mut out []u8, n i64) {
 	mut tmp := [20]u8{}
@@ -113,61 +112,20 @@ fn wi(mut out []u8, n i64) {
 		return
 	}
 	mut x := n
-	mut neg := false
-	if x < 0 {
-		neg = true
-		x = -x
-	}
 	mut i := 20
 	for x > 0 {
 		i--
 		tmp[i] = u8(`0`) + u8(x % 10)
 		x /= 10
 	}
-	if neg {
-		i--
-		tmp[i] = u8(`-`)
-	}
 	unsafe { out.push_many(&tmp[i], 20 - i) }
 }
 
-// ws_json_str appends a JSON-escaped string value (no surrounding quotes). Fast
-// path: most values have no special characters, so emit them as one bulk copy.
-@[direct_array_access]
-fn ws_json_str(mut out []u8, s []u8) {
-	mut needs := false
-	for c in s {
-		if c == `"` || c == `\\` || c < 0x20 {
-			needs = true
-			break
-		}
-	}
-	if !needs {
-		wb(mut out, s)
-		return
-	}
-	for c in s {
-		match c {
-			`"` { ws(mut out, '\\"') }
-			`\\` { ws(mut out, '\\\\') }
-			`\n` { ws(mut out, '\\n') }
-			`\r` { ws(mut out, '\\r') }
-			`\t` { ws(mut out, '\\t') }
-			else { unsafe { out.push_many(&c, 1) } }
-		}
-	}
-}
-
-// emit writes a complete 200 response with a precomputed body into `out`.
-fn emit(mut out []u8, ctype string, body []u8) {
-	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
-	ws(mut out, ctype)
-	ws(mut out, '\r\nContent-Length: ')
-	wi(mut out, i64(body.len))
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	wb(mut out, body)
-}
-
+// write_resp appends a complete HTTP/1.1 response (status line + headers + body)
+// straight into the connection's persistent write buffer — no intermediate
+// strings.Builder, no body→response copy, no per-request heap allocation. This
+// is the zero-alloc twin of `ok()`; the latter survives only for the DB paths
+// that are allocation-bound anyway.
 fn write_resp(mut out []u8, ctype string, body string) {
 	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
 	ws(mut out, ctype)
@@ -177,263 +135,77 @@ fn write_resp(mut out []u8, ctype string, body string) {
 	ws(mut out, body)
 }
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-
-const created = 'HTTP/1.1 201 Created\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-
-const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-
-// ── async handler ────────────────────────────────────────────────────────────
-
-fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	mut w := unsafe { &WorkerCtx(ac.state) }
-	req := request_parser.decode_http_request(req_buffer) or {
-		wb(mut out, bad_request)
-		return .done
-	}
+fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
+	req := request_parser.decode_http_request(req_buffer)!
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
 	target := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
+	// Route on the path before '?' WITHOUT allocating: a tos() view into the
+	// request buffer rather than all_before()'s per-request copy. (Sub-slices like
+	// route[6..] still copy, but only on the few paths that actually need them.)
 	qpos := target.index_u8(`?`)
 	route := if qpos < 0 { target } else { unsafe { tos(target.str, qpos) } }
 
 	if route == '/pipeline' {
 		write_resp(mut out, 'text/plain', 'ok')
-		return .done
 	} else if route == '/baseline11' {
 		mut sum := qint(req, qk_a) + qint(req, qk_b)
 		if method == 'POST' {
 			sum += body_int(req)
 		}
 		write_resp(mut out, 'text/plain', sum.str())
-		return .done
 	} else if route == '/upload' {
+		// Answer by Content-Length: the engine streams (drains) large bodies
+		// instead of buffering them, so req.body may be empty — but the declared
+		// length is what the upload profile asks for. Falls back to the buffered
+		// body length when no Content-Length is present (small/bufferable bodies).
 		cl := req.content_length()
 		n := if cl >= 0 { i64(cl) } else { i64(req.body.len) }
 		write_resp(mut out, 'text/plain', n.str())
-		return .done
 	} else if route.starts_with('/json/') {
-		count := clamp_count(parse_u_at(route, 6), w.ro.dataset.len)
+		count := clamp_count(parse_u_at(route, 6), sh.dataset.len)
 		mut m := qint(req, qk_m)
 		if m == 0 {
 			m = 1
 		}
 		if accepts_gzip(req) {
-			w.write_json_gzip(mut out, count, m)
+			// json-comp profile: gzip the body and set Content-Encoding.
+			sh.write_json_gzip(mut out, count, m)
 		} else {
-			w.write_json_response(mut out, count, m)
+			sh.write_json_response(mut out, count, m)
 		}
-		return .done
 	} else if route == '/async-db' {
-		return w.start_async_db(mut out, mut ac, qint(req, qk_min), qint(req, qk_max), qint(req,
-			qk_limit))
+		write_resp(mut out, 'application/json', sh.async_db(qint(req, qk_min), qint(req, qk_max),
+			qint(req, qk_limit)))
 	} else if route == '/fortunes' {
-		return w.start_fortunes(mut out, mut ac)
+		write_resp(mut out, 'text/html; charset=utf-8', sh.fortunes())
 	} else if route.starts_with('/static/') {
-		if f := w.ro.assets[route[8..]] {
+		if f := sh.assets[route[8..]] {
+			// Head into write_buf, body via sendfile(2) — zero userspace copy.
 			wb(mut out, f.header)
 			core.queue_file(f.fd, 0, f.size)
 		} else {
 			wb(mut out, not_found)
 		}
-		return .done
 	} else if route == '/crud/items' {
 		if method == 'POST' {
-			return w.start_crud_create(mut out, mut ac, req)
+			wb(mut out, sh.crud_create(req))
+		} else {
+			wb(mut out, sh.crud_list(qstr(req, qk_category), qint(req, qk_page), qint(req, qk_limit)))
 		}
-		return w.start_crud_list(mut out, mut ac, qstr(req, qk_category), qint(req, qk_page), qint(req,
-			qk_limit))
 	} else if route.starts_with('/crud/items/') {
 		id := int(parse_u_at(route, 12))
 		if method == 'PUT' {
-			return w.start_crud_update(mut out, mut ac, id, req)
+			wb(mut out, sh.crud_update(id, req))
+		} else {
+			wb(mut out, sh.crud_get(id))
 		}
-		return w.start_crud_get(mut out, mut ac, id)
-	}
-	wb(mut out, not_found)
-	return .done
-}
-
-// park submits a query and parks the request on its connection, stashing the
-// render kind (+ id/page for the routes that need them) for the continuation.
-// On a pool/flush failure it answers synchronously with `fallback`.
-fn (mut w WorkerCtx) park(mut out []u8, mut ac core.AsyncCtx, query_text string, params []?[]u8, kind u8, id int, page i64, fallback []u8) core.AsyncStep {
-	idx := w.pool.acquire() or {
-		wb(mut out, fallback)
-		return .done
-	}
-	mut c := w.pool.conn(idx)
-	c.async_submit(query_text, params)
-	c.async_flush() or {
-		w.pool.release(idx)
-		wb(mut out, fallback)
-		return .done
-	}
-	st := &Stash{
-		kind:     kind
-		conn_idx: idx
-		id:       id
-		page:     page
-	}
-	ac.watch(w.pool.fd(idx), .readable, on_db_ready, voidptr(st))
-	return .suspend
-}
-
-// on_db_ready resumes a parked request when its PG socket is readable: pump the
-// result, render by kind, release the connection.
-fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	mut w := unsafe { &WorkerCtx(ac.state) }
-	st := unsafe { &Stash(ac.udata) }
-	mut c := w.pool.conn(st.conn_idx)
-	poll := c.async_on_readable() or {
-		w.pool.release(st.conn_idx)
-		w.render_error(mut out, st.kind)
-		return .done
-	}
-	if !poll.ready {
-		ac.watch(w.pool.fd(st.conn_idx), .readable, on_db_ready, ac.udata) // more bytes to come
-		return .suspend
-	}
-	res := poll.result
-	match st.kind {
-		k_async_db { w.render_async_db(mut out, res) }
-		k_fortunes { render_fortunes(mut out, res) }
-		k_crud_get { w.render_crud_get(mut out, res, st.id) }
-		k_crud_list { render_crud_list(mut out, res, st.page) }
-		k_crud_create { wb(mut out, created) }
-		k_crud_update { w.render_crud_update(mut out, st.id) }
-		else { wb(mut out, not_found) }
-	}
-
-	w.pool.release(st.conn_idx)
-	return .done
-}
-
-fn (w &WorkerCtx) render_error(mut out []u8, kind u8) {
-	match kind {
-		k_async_db {
-			write_resp(mut out, 'application/json', '{"items":[],"count":0}')
-		}
-		k_fortunes {
-			write_resp(mut out, 'text/html; charset=utf-8',
-				'<!doctype html><html><body><table></table></body></html>')
-		}
-		k_crud_list {
-			write_resp(mut out, 'application/json', '{"items":[],"total":0,"page":1}')
-		}
-		k_crud_get {
-			wb(mut out, not_found)
-		}
-		else {
-			wb(mut out, bad_request)
-		}
+	} else {
+		wb(mut out, not_found)
 	}
 }
 
-// ── /async-db ────────────────────────────────────────────────────────────────
-
-const async_db_sql = 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3'
-
-fn (mut w WorkerCtx) start_async_db(mut out []u8, mut ac core.AsyncCtx, min i64, max i64, limit i64) core.AsyncStep {
-	mut lim := limit
-	if lim < 1 {
-		lim = 1
-	}
-	if lim > 50 {
-		lim = 50
-	}
-	params := [?[]u8(min.str().bytes()), ?[]u8(max.str().bytes()), ?[]u8(lim.str().bytes())]
-	return w.park(mut out, mut ac, async_db_sql, params, k_async_db, 0, 0,
-		'{"items":[],"count":0}'.bytes())
-}
-
-fn (w &WorkerCtx) render_async_db(mut out []u8, res pg_async.Result) {
-	mut body := []u8{cap: 4096}
-	ws(mut body, '{"items":[')
-	mut rows := res.rows()
-	mut count := 0
-	for {
-		row := rows.next() or { break }
-		if count > 0 {
-			ws(mut body, ',')
-		}
-		render_item(mut body, row)
-		count++
-	}
-	ws(mut body, '],"count":')
-	wi(mut body, i64(count))
-	ws(mut body, '}')
-	emit(mut out, 'application/json', body)
-}
-
-// render_item writes one items-row as JSON. tags is JSONB read in binary: a
-// 0x01 version byte then JSON text, so it is emitted RAW (already valid JSON) —
-// no decode/re-encode round-trip.
-@[direct_array_access]
-fn render_item(mut body []u8, row pg_async.Row) {
-	ws(mut body, '{"id":')
-	wi(mut body, i64(row.int4(0) or { 0 }))
-	ws(mut body, ',"name":"')
-	ws_json_str(mut body, row.text(1) or { ''.bytes() })
-	ws(mut body, '","category":"')
-	ws_json_str(mut body, row.text(2) or { ''.bytes() })
-	ws(mut body, '","price":')
-	wi(mut body, i64(row.int4(3) or { 0 }))
-	ws(mut body, ',"quantity":')
-	wi(mut body, i64(row.int4(4) or { 0 }))
-	ws(mut body, ',"active":')
-	ws(mut body, if row.boolean(5) or { false } { 'true' } else { 'false' })
-	ws(mut body, ',"tags":')
-	wb(mut body, pg_async.jsonb_text(row.text(6) or { '[]'.bytes() }))
-	ws(mut body, ',"rating":{"score":')
-	wi(mut body, i64(row.int4(7) or { 0 }))
-	ws(mut body, ',"count":')
-	wi(mut body, i64(row.int4(8) or { 0 }))
-	ws(mut body, '}}')
-}
-
-// ── /fortunes ────────────────────────────────────────────────────────────────
-
-fn (mut w WorkerCtx) start_fortunes(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	return w.park(mut out, mut ac, 'SELECT id, message FROM fortune', []?[]u8{}, k_fortunes, 0, 0,
-		'<!doctype html><html><body><table></table></body></html>'.bytes())
-}
-
-fn render_fortunes(mut out []u8, res pg_async.Result) {
-	mut fortunes := []Fortune{}
-	mut rows := res.rows()
-	for {
-		row := rows.next() or { break }
-		fortunes << Fortune{
-			id:      row.int4(0) or { 0 }
-			message: (row.text(1) or { ''.bytes() }).bytestr().clone()
-		}
-	}
-	fortunes << Fortune{
-		id:      0
-		message: 'Additional fortune added at request time.'
-	}
-	fortunes.sort(a.message < b.message)
-	mut body := []u8{cap: 32768}
-	ws(mut body,
-		'<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
-	for f in fortunes {
-		ws(mut body, '<tr><td>')
-		wi(mut body, i64(f.id))
-		ws(mut body, '</td><td>')
-		ws(mut body, escape_html(f.message))
-		ws(mut body, '</td></tr>')
-	}
-	ws(mut body, '</table></body></html>')
-	emit(mut out, 'text/html; charset=utf-8', body)
-}
-
-// ── /crud ────────────────────────────────────────────────────────────────────
-
-// crud_list uses a single window-count query (count(*) OVER()) so the page and
-// the total come back together — one park instead of two queries.
-const crud_list_sql = 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count, count(*) OVER() FROM items WHERE category = \$1 ORDER BY id LIMIT \$2 OFFSET \$3'
-
-fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, category string, page i64, limit i64) core.AsyncStep {
+// crud_list returns a paginated, category-filtered page of items.
+fn (mut sh Shared) crud_list(category string, page i64, limit i64) []u8 {
 	mut p := page
 	if p < 1 {
 		p = 1
@@ -446,123 +218,132 @@ fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, categor
 		lim = 100
 	}
 	offset := (p - 1) * lim
-	params := [?[]u8(category.bytes()), ?[]u8(lim.str().bytes()), ?[]u8(offset.str().bytes())]
-	return w.park(mut out, mut ac, crud_list_sql, params, k_crud_list, 0, p,
-		'{"items":[],"total":0,"page":1}'.bytes())
-}
-
-fn render_crud_list(mut out []u8, res pg_async.Result, page i64) {
-	mut body := []u8{cap: 8192}
-	ws(mut body, '{"items":[')
-	mut rows := res.rows()
-	mut count := 0
-	mut total := i64(0)
-	for {
-		row := rows.next() or { break }
-		if count > 0 {
-			ws(mut body, ',')
-		}
-		render_item(mut body, row)
-		total = row.int8(9) or { 0 } // count(*) OVER() — same in every row
-		count++
+	mut conn := sh.pool.acquire() or { return ok('application/json', '{"items":[],"total":0,"page":1}') }
+	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE category = \$1 ORDER BY id LIMIT \$2 OFFSET \$3',
+		[category, lim.str(), offset.str()]) or {
+		sh.pool.release(conn)
+		return ok('application/json', '{"items":[],"total":0,"page":1}')
 	}
-	ws(mut body, '],"total":')
-	wi(mut body, total)
-	ws(mut body, ',"page":')
-	wi(mut body, page)
-	ws(mut body, '}')
-	emit(mut out, 'application/json', body)
+	trows := conn.exec_param_many('SELECT count(*) FROM items WHERE category = \$1', [category]) or {
+		[]
+	}
+	sh.pool.release(conn)
+	total := if trows.len > 0 { nn(trows[0].vals[0]).int() } else { 0 }
+	mut items := []DbItem{cap: rows.len}
+	for row in rows {
+		items << row_to_item(row)
+	}
+	mut sb := strings.new_builder(items.len * 200 + 64)
+	sb.write_string('{"items":')
+	sb.write_string(json.encode(items))
+	sb.write_string(',"total":')
+	sb.write_decimal(i64(total))
+	sb.write_string(',"page":')
+	sb.write_decimal(p)
+	sb.write_u8(`}`)
+	return ok('application/json', sb.str())
 }
 
-fn (mut w WorkerCtx) start_crud_get(mut out []u8, mut ac core.AsyncCtx, id int) core.AsyncStep {
-	w.ro.cache_mu.@rlock()
-	cached := w.ro.cache[id] or { []u8{} }
-	w.ro.cache_mu.runlock()
+// crud_get returns a single item, using a cache-aside in-memory cache and
+// reporting the result via the X-Cache header (MISS on first read, HIT after).
+fn (mut sh Shared) crud_get(id int) []u8 {
+	sh.cache_mu.@rlock()
+	cached := sh.cache[id] or { '' }
+	sh.cache_mu.runlock()
 	if cached.len > 0 {
-		// Cache hit: answer synchronously, no DB round-trip.
-		ws(mut out,
-			'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
-		wi(mut out, i64(cached.len))
-		ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-		wb(mut out, cached)
-		return .done
+		return ok_xcache('application/json', cached, 'HIT')
 	}
-	params := [?[]u8(id.str().bytes())]
-	return w.park(mut out, mut ac,
-		'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
-		params, k_crud_get, id, 0, not_found)
+	mut conn := sh.pool.acquire() or { return not_found }
+	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
+		[id.str()]) or {
+		sh.pool.release(conn)
+		return not_found
+	}
+	sh.pool.release(conn)
+	if rows.len == 0 {
+		return not_found
+	}
+	body := json.encode(row_to_item(rows[0]))
+	sh.cache_mu.@lock()
+	sh.cache[id] = body
+	sh.cache_mu.unlock()
+	return ok_xcache('application/json', body, 'MISS')
 }
 
-fn (mut w WorkerCtx) render_crud_get(mut out []u8, res pg_async.Result, id int) {
-	mut rows := res.rows()
-	row := rows.next() or {
-		wb(mut out, not_found)
-		return
-	}
-	mut item := []u8{cap: 512}
-	render_item(mut item, row)
-	w.ro.cache_mu.@lock()
-	w.ro.cache[id] = item // populate the shared cache-aside
-	w.ro.cache_mu.unlock()
-	ws(mut out,
-		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: MISS\r\nContent-Type: application/json\r\nContent-Length: ')
-	wi(mut out, i64(item.len))
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	wb(mut out, item)
-}
-
-fn (mut w WorkerCtx) start_crud_create(mut out []u8, mut ac core.AsyncCtx, req request_parser.HttpRequest) core.AsyncStep {
+// crud_create inserts a new item from the JSON body and returns 201.
+fn (mut sh Shared) crud_create(req request_parser.HttpRequest) []u8 {
 	raw := unsafe { tos(&req.buffer[req.body.start], req.body.len) }
-	c := json.decode(CrudCreate, raw) or {
-		wb(mut out, bad_request)
-		return .done
+	c := json.decode(CrudCreate, raw) or { return bad_request }
+	mut conn := sh.pool.acquire() or { return bad_request }
+	conn.exec_param_many("INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
+		[c.id.str(), c.name, c.category, c.price.str(), c.quantity.str()]) or {
+		sh.pool.release(conn)
+		return bad_request
 	}
-	params := [?[]u8(c.id.str().bytes()), ?[]u8(c.name.bytes()), ?[]u8(c.category.bytes()),
-		?[]u8(c.price.str().bytes()), ?[]u8(c.quantity.str().bytes())]
-	return w.park(mut out, mut ac,
-		"INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
-		params, k_crud_create, 0, 0, bad_request)
+	sh.pool.release(conn)
+	return created
 }
 
-fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id int, req request_parser.HttpRequest) core.AsyncStep {
+// crud_update updates an item and invalidates its cache entry.
+fn (mut sh Shared) crud_update(id int, req request_parser.HttpRequest) []u8 {
 	raw := unsafe { tos(&req.buffer[req.body.start], req.body.len) }
-	c := json.decode(CrudCreate, raw) or {
-		wb(mut out, bad_request)
-		return .done
+	c := json.decode(CrudCreate, raw) or { return bad_request }
+	mut conn := sh.pool.acquire() or { return bad_request }
+	conn.exec_param_many('UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
+		[id.str(), c.name, c.category, c.price.str(), c.quantity.str()]) or {
+		sh.pool.release(conn)
+		return bad_request
 	}
-	params := [?[]u8(id.str().bytes()), ?[]u8(c.name.bytes()), ?[]u8(c.category.bytes()),
-		?[]u8(c.price.str().bytes()), ?[]u8(c.quantity.str().bytes())]
-	return w.park(mut out, mut ac,
-		'UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
-		params, k_crud_update, id, 0, bad_request)
+	sh.pool.release(conn)
+	sh.cache_mu.@lock()
+	sh.cache.delete(id)
+	sh.cache_mu.unlock()
+	return ok('application/json', '{"status":"ok"}')
 }
 
-fn (mut w WorkerCtx) render_crud_update(mut out []u8, id int) {
-	w.ro.cache_mu.@lock()
-	w.ro.cache.delete(id) // invalidate the cache-aside entry
-	w.ro.cache_mu.unlock()
-	write_resp(mut out, 'application/json', '{"status":"ok"}')
+fn row_to_item(row pg.Row) DbItem {
+	return DbItem{
+		id:       nn(row.vals[0]).int()
+		name:     nn(row.vals[1])
+		category: nn(row.vals[2])
+		price:    nn(row.vals[3]).int()
+		quantity: nn(row.vals[4]).int()
+		active:   nn(row.vals[5]) == 't'
+		tags:     json.decode([]string, nn3(row.vals[6], '[]')) or { [] }
+		rating:   Rating{
+			score: nn(row.vals[7]).i64()
+			count: nn(row.vals[8]).i64()
+		}
+	}
 }
 
-// ── /json (non-DB) ───────────────────────────────────────────────────────────
+const not_found = 'HTTP/1.1 404 Not Found\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
-fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
-	// 21 = len('{"items":[') + len('],"count":') + '}'; plus the count's own digits
-	mut clen := 21 + digits(i64(count))
+const created = 'HTTP/1.1 201 Created\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+// json_response builds the FULL HTTP response (headers + body) for /json in a
+// single allocation — no per-request reflection and no body→response copy.
+// Only `total` (price*quantity*m) varies per request; the rest is a precomputed
+// prefix. Content-Length is computed up front so everything lands in one buffer.
+fn (sh &Shared) write_json_response(mut out []u8, count int, m i64) {
+	mut clen := 21 + digits(i64(count)) // len('{"items":[') + len('],"count":') + '}' + count digits
 	if count > 0 {
-		clen += count - 1
+		clen += count - 1 // item separators
 	}
 	for i in 0 .. count {
-		t := w.ro.dataset[i].price * w.ro.dataset[i].quantity * m
-		clen += w.ro.prefixes[i].len + digits(t) + 1
+		t := sh.dataset[i].price * sh.dataset[i].quantity * m
+		clen += sh.prefixes[i].len + digits(t) + 1 // prefix + total + '}'
 	}
-	ws(mut out,
-		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
+	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, i64(clen))
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"items":[')
 	for i in 0 .. count {
-		ws(mut out, w.ro.prefixes[i])
-		wi(mut out, w.ro.dataset[i].price * w.ro.dataset[i].quantity * m)
+		ws(mut out, sh.prefixes[i])
+		wi(mut out, sh.dataset[i].price * sh.dataset[i].quantity * m)
+		// fuse each object's closing `}` with the item separator `,` into one
+		// bulk write — single-element `<<` is the slow path on post-0.5.1 V.
 		ws(mut out, if i < count - 1 { '},' } else { '}' })
 	}
 	ws(mut out, '],"count":')
@@ -570,43 +351,49 @@ fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
 	ws(mut out, '}')
 }
 
-fn (mut w WorkerCtx) write_json_gzip(mut out []u8, count int, m i64) {
+// write_json_gzip is the json-comp path. The gzipped response for a given
+// (count, m) is fully deterministic and gzip CPU dominates the cost, so we cache
+// the COMPLETE response bytes and just append the cached copy on a hit — no
+// rebuild, no recompress. Compressing once instead of per-request is the whole
+// win for json-comp (the profile is compression-bound, not allocation-bound).
+fn (mut sh Shared) write_json_gzip(mut out []u8, count int, m i64) {
 	key := (u64(u32(count)) << 32) | u64(u32(m))
-	w.ro.gz_mu.@rlock()
-	cached := w.ro.gz_cache[key] or { []u8{} }
-	w.ro.gz_mu.runlock()
+	sh.gz_mu.@rlock()
+	cached := sh.gz_cache[key] or { []u8{} }
+	sh.gz_mu.runlock()
 	if cached.len > 0 {
 		wb(mut out, cached)
 		return
 	}
-	body := w.json_body(count, m)
+	body := sh.json_body(count, m)
 	gz := gzip.compress(body.bytes()) or {
 		write_resp(mut out, 'application/json', body)
 		return
 	}
 	mut resp := []u8{cap: gz.len + 128}
-	ws(mut resp,
-		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
+	ws(mut resp, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut resp, i64(gz.len))
 	ws(mut resp, '\r\nConnection: keep-alive\r\n\r\n')
 	unsafe { resp.push_many(gz.data, gz.len) }
-	w.ro.gz_mu.@lock()
-	if w.ro.gz_cache.len < 1024 {
-		w.ro.gz_cache[key] = resp
+	// Store it (bounded so a flood of distinct m values can't grow it without limit).
+	sh.gz_mu.@lock()
+	if sh.gz_cache.len < 1024 {
+		sh.gz_cache[key] = resp
 	}
-	w.ro.gz_mu.unlock()
+	sh.gz_mu.unlock()
 	wb(mut out, resp)
 }
 
-fn (w &WorkerCtx) json_body(count int, m i64) string {
+// json_body builds just the /json body string (used for the gzip path).
+fn (sh &Shared) json_body(count int, m i64) string {
 	mut sb := strings.new_builder(count * 224 + 32)
 	sb.write_string('{"items":[')
 	for i in 0 .. count {
 		if i > 0 {
 			sb.write_u8(`,`)
 		}
-		sb.write_string(w.ro.prefixes[i])
-		sb.write_decimal(w.ro.dataset[i].price * w.ro.dataset[i].quantity * m)
+		sb.write_string(sh.prefixes[i])
+		sb.write_decimal(sh.dataset[i].price * sh.dataset[i].quantity * m)
 		sb.write_u8(`}`)
 	}
 	sb.write_string('],"count":')
@@ -615,9 +402,43 @@ fn (w &WorkerCtx) json_body(count int, m i64) string {
 	return sb.str()
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// fortunes queries the fortune table, appends the runtime row, sorts by message
+// and renders the HTML table (escaped). 199 seeded + 1 runtime + header = 201 <tr>.
+fn (mut sh Shared) fortunes() string {
+	mut fortunes := []Fortune{}
+	mut conn := sh.pool.acquire() or {
+		return '<!doctype html><html><body><table></table></body></html>'
+	}
+	rows := conn.exec_param_many('SELECT id, message FROM fortune', []) or { [] }
+	sh.pool.release(conn)
+	for row in rows {
+		fortunes << Fortune{
+			id:      nn(row.vals[0]).int()
+			message: nn(row.vals[1])
+		}
+	}
+	fortunes << Fortune{
+		id:      0
+		message: 'Additional fortune added at request time.'
+	}
+	fortunes.sort(a.message < b.message)
+	mut sb := strings.new_builder(32768)
+	sb.write_string('<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
+	for f in fortunes {
+		sb.write_string('<tr><td>')
+		sb.write_decimal(i64(f.id))
+		sb.write_string('</td><td>')
+		sb.write_string(escape_html(f.message))
+		sb.write_string('</td></tr>')
+	}
+	sb.write_string('</table></body></html>')
+	return sb.str()
+}
 
 fn escape_html(s string) string {
+	// Fast path: most fortune messages contain no special characters, so return
+	// the original with no allocation instead of replace_each's 5 full-string
+	// passes (each scanning + reallocating). Only escape when there's something to.
 	mut needs := false
 	for c in s {
 		if c == `&` || c == `<` || c == `>` || c == `"` || c == `'` {
@@ -642,6 +463,7 @@ fn escape_html(s string) string {
 	return b.str()
 }
 
+// digits returns the number of decimal digits in a non-negative integer.
 fn digits(n i64) int {
 	if n < 10 {
 		return 1
@@ -655,6 +477,66 @@ fn digits(n i64) int {
 	return d
 }
 
+fn (mut sh Shared) async_db(min i64, max i64, limit i64) string {
+	mut lim := limit
+	if lim < 1 {
+		lim = 1
+	}
+	if lim > 50 {
+		lim = 50
+	}
+	mut conn := sh.pool.acquire() or { return '{"items":[],"count":0}' }
+	// Prepared statement: PostgreSQL parses the SQL once per connection instead of
+	// on every request (exec_param_many re-parses each call). Lazily prepare on the
+	// connection's first use — prepared statements are per-session and the pool
+	// reuses sessions, so after warmup every connection serves exec_prepared.
+	adb_params := [min.str(), max.str(), lim.str()]
+	rows := conn.exec_prepared('vanilla_async_db', adb_params) or {
+		conn.prepare('vanilla_async_db', 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3',
+			3) or {
+			sh.pool.release(conn)
+			return '{"items":[],"count":0}'
+		}
+		conn.exec_prepared('vanilla_async_db', adb_params) or {
+			sh.pool.release(conn)
+			return '{"items":[],"count":0}'
+		}
+	}
+	sh.pool.release(conn)
+	mut items := []DbItem{cap: rows.len}
+	for row in rows {
+		items << DbItem{
+			id:       nn(row.vals[0]).int()
+			name:     nn(row.vals[1])
+			category: nn(row.vals[2])
+			price:    nn(row.vals[3]).int()
+			quantity: nn(row.vals[4]).int()
+			active:   nn(row.vals[5]) == 't'
+			tags:     json.decode([]string, nn3(row.vals[6], '[]')) or { [] }
+			rating:   Rating{
+				score: nn(row.vals[7]).i64()
+				count: nn(row.vals[8]).i64()
+			}
+		}
+	}
+	return json.encode(DbResp{ items: items, count: items.len })
+}
+
+// nn unwraps a nullable column value to a plain string ('' for NULL).
+@[inline]
+fn nn(v ?string) string {
+	return v or { '' }
+}
+
+// nn3 unwraps a nullable column value with a custom default.
+@[inline]
+fn nn3(v ?string, d string) string {
+	return v or { d }
+}
+
+// Precomputed query-parameter key bytes, built once at init. The hot path then
+// never allocates a []u8 per lookup — `key.bytes()` did, one alloc per request
+// per parameter (baseline parses a+b, async-db min+max+limit, etc.).
 const qk_a = 'a'.bytes()
 const qk_b = 'b'.bytes()
 const qk_m = 'm'.bytes()
@@ -664,16 +546,24 @@ const qk_limit = 'limit'.bytes()
 const qk_page = 'page'.bytes()
 const qk_category = 'category'.bytes()
 
+// qint reads a query parameter as an integer (0 if absent / non-numeric). The
+// key is a precomputed []u8 (qk_*) so there is no per-call allocation; the value
+// is read as a zero-copy tos() view and parsed in place.
 fn qint(req request_parser.HttpRequest, key []u8) i64 {
 	s := req.get_query_slice(key) or { return 0 }
 	return unsafe { tos(&req.buffer[s.start], s.len) }.i64()
 }
 
+// qstr reads a query parameter as a string ('' if absent). Clones so the value
+// outlives the request buffer (it is passed to the DB driver).
 fn qstr(req request_parser.HttpRequest, key []u8) string {
 	s := req.get_query_slice(key) or { return '' }
 	return unsafe { tos(&req.buffer[s.start], s.len) }.clone()
 }
 
+// parse_u_at parses a non-negative integer from `s` starting at byte `start`,
+// stopping at the first non-digit — no substring allocation (route[6..].i64()
+// copies). Used to read the count / id embedded in the request path.
 @[direct_array_access]
 fn parse_u_at(s string, start int) i64 {
 	mut n := i64(0)
@@ -697,6 +587,8 @@ fn clamp_count(n i64, max int) int {
 	return int(n)
 }
 
+// body_int parses the request body as an integer, decoding chunked transfer
+// encoding when present.
 fn body_int(req request_parser.HttpRequest) i64 {
 	if req.body.len == 0 {
 		return 0
@@ -711,6 +603,7 @@ fn body_int(req request_parser.HttpRequest) i64 {
 	return raw.i64()
 }
 
+// dechunk decodes an HTTP/1.1 chunked body into its payload.
 fn dechunk(s string) string {
 	mut out := strings.new_builder(s.len)
 	mut i := 0
@@ -722,7 +615,7 @@ fn dechunk(s string) string {
 		}
 		data_start := nl + 2
 		out.write_string(s[data_start..data_start + size])
-		i = data_start + size + 2
+		i = data_start + size + 2 // skip data + trailing CRLF
 	}
 	return out.str()
 }
@@ -744,11 +637,39 @@ fn strconv_hex(s string) int {
 	return n
 }
 
+// ok builds a complete HTTP/1.1 response with the given content type.
+fn ok(ctype string, body string) []u8 {
+	mut sb := strings.new_builder(body.len + 96)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
+	sb.write_string(ctype)
+	sb.write_string('\r\nContent-Length: ')
+	sb.write_decimal(i64(body.len))
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
+	sb.write_string(body)
+	return sb
+}
+
+// ok_xcache builds a JSON response carrying an X-Cache: HIT|MISS header.
+fn ok_xcache(ctype string, body string, cache string) []u8 {
+	mut sb := strings.new_builder(body.len + 96)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: ')
+	sb.write_string(cache)
+	sb.write_string('\r\nContent-Type: ')
+	sb.write_string(ctype)
+	sb.write_string('\r\nContent-Length: ')
+	sb.write_decimal(i64(body.len))
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
+	sb.write_string(body)
+	return sb
+}
+
+// accepts_gzip reports whether the request advertises gzip in Accept-Encoding.
 fn accepts_gzip(req request_parser.HttpRequest) bool {
 	ae := req.get_header_value_slice('Accept-Encoding') or { return false }
 	return unsafe { tos(&req.buffer[ae.start], ae.len) }.contains('gzip')
 }
 
+// content_type maps a file extension to a MIME type for the static handler.
 fn content_type(name string) string {
 	ext := name.all_after_last('.')
 	return match ext {
@@ -763,18 +684,8 @@ fn content_type(name string) string {
 	}
 }
 
-fn static_header(ctype string, size i64) []u8 {
-	mut sb := strings.new_builder(96)
-	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
-	sb.write_string(ctype)
-	sb.write_string('\r\nContent-Length: ')
-	sb.write_decimal(size)
-	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	return sb
-}
-
-// parse_db_url turns postgres://user:pass@host:port/dbname into a pg_async.ConnConfig.
-fn parse_db_url(u string) pg_async.ConnConfig {
+// parse_db_url turns postgres://user:pass@host:port/dbname into a pg.Config.
+fn parse_db_url(u string) pg.Config {
 	mut s := u
 	if s.contains('://') {
 		s = s.all_after('://')
@@ -786,47 +697,41 @@ fn parse_db_url(u string) pg_async.ConnConfig {
 	if host_port.contains(':') {
 		port = host_port.all_after(':').int()
 	}
-	return pg_async.ConnConfig{
+	return pg.Config{
 		host:     host_port.all_before(':')
 		port:     port
 		user:     creds.all_before(':')
 		password: creds.all_after(':')
-		database: rest.all_after('/')
+		dbname:   rest.all_after('/')
 	}
 }
 
 fn main() {
 	url := os.getenv_opt('DATABASE_URL') or { 'postgres://bench:bench@localhost:5432/benchmark' }
-	cfg := parse_db_url(url)
-
-	// DATABASE_MAX_CONN is the TOTAL connection budget; split it across the
-	// thread-per-core workers (each worker owns its own pool, 1..8 connections).
-	mut total := (os.getenv_opt('DATABASE_MAX_CONN') or { '64' }).int()
-	if total < 1 {
-		total = 64
+	mut size := (os.getenv_opt('DATABASE_MAX_CONN') or { '64' }).int()
+	if size < 1 {
+		size = 64
 	}
-	// Use the cpuset-aware worker count (core.max_thread_pool_size) — matches how
-	// many worker threads the engine actually spawns — so the per-worker pool size
-	// is computed against real usable cores, not the host CPU count.
-	workers := core.max_thread_pool_size
-	mut per_worker := total / workers
-	if per_worker < 1 {
-		per_worker = 1
+	if size > 200 {
+		size = 200 // leave headroom under Postgres max_connections
 	}
-	if per_worker > 8 {
-		per_worker = 8
-	}
+	mut pool := pg.new_connection_pool(parse_db_url(url), size)!
 
 	dataset_path := os.getenv_opt('DATASET_PATH') or { '/data/dataset.json' }
 	dataset_raw := os.read_file(dataset_path) or { '[]' }
 	dataset := json.decode([]DatasetItem, dataset_raw) or { []DatasetItem{} }
 
+	// Precompute each item's JSON prefix once: `{…,"rating":{…},"total":`
+	// (drop the closing brace, append the total key). Only the total value is
+	// request-dependent, so the hot path never serializes a struct.
 	mut prefixes := []string{cap: dataset.len}
 	for it in dataset {
 		enc := json.encode(it)
 		prefixes << enc#[..-1] + ',"total":'
 	}
 
+	// Preload static assets into memory as ready-to-send responses (originals
+	// only; skip the precompressed .gz/.br siblings — we serve identity).
 	mut assets := map[string]StaticFile{}
 	static_dir := os.getenv_opt('STATIC_DIR') or { '/data/static' }
 	for name in os.ls(static_dir) or { []string{} } {
@@ -835,7 +740,9 @@ fn main() {
 		}
 		path := '${static_dir}/${name}'
 		fsize := i64(os.file_size(path))
-		fd := C.open(&char(path.str), 0)
+		// Open once, keep the fd for the server's life (borrowed; sendfile reads
+		// from the page cache with an explicit offset, so the fd is shared safely).
+		fd := C.open(&char(path.str), 0) // O_RDONLY
 		if fd < 0 {
 			continue
 		}
@@ -846,11 +753,12 @@ fn main() {
 		}
 	}
 
-	ro := &Shared{
+	mut sh := Shared{
+		pool:     pool
 		dataset:  dataset
 		prefixes: prefixes
 		assets:   assets
-		cache:    map[int][]u8{}
+		cache:    map[int]string{}
 		cache_mu: sync.new_rwmutex()
 		gz_cache: map[u64][]u8{}
 		gz_mu:    sync.new_rwmutex()
@@ -860,19 +768,25 @@ fn main() {
 		port:            8080
 		io_multiplexing: .epoll
 		limits:          http_server.Limits{
-			max_request_bytes: 32 * 1024 * 1024
+			max_request_bytes: 32 * 1024 * 1024 // accept the 20 MiB upload bodies
 		}
-		async_handler:   handle
-		make_state:      fn [ro, cfg, per_worker] () voidptr {
-			pool := pg_async.new_pool(cfg, per_worker) or {
-				panic('vanilla-epoll: pg pool bring-up failed: ${err}')
-			}
-			w := &WorkerCtx{
-				ro:   ro
-				pool: pool
-			}
-			return voidptr(w)
+		request_handler: fn [mut sh] (req_buffer []u8, fd int, mut out []u8) ! {
+			handle(req_buffer, fd, mut out, mut sh)!
 		}
 	})!
 	server.run()
+}
+
+// static_header prebuilds the HTTP response head (status line + headers) for a
+// static file. The body is streamed separately, zero-copy, with sendfile(2) via
+// core.queue_file — so the body never gets copied into the per-connection write
+// buffer (which would grow into a large scanned GC block, the static "cliff").
+fn static_header(ctype string, size i64) []u8 {
+	mut sb := strings.new_builder(96)
+	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
+	sb.write_string(ctype)
+	sb.write_string('\r\nContent-Length: ')
+	sb.write_decimal(size)
+	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
+	return sb
 }
