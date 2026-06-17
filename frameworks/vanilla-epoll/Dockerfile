@@ -25,11 +25,13 @@ RUN git clone --branch 0.5.1 --depth 1 https://github.com/vlang/v /opt/v && \
     ln -s /opt/v/v /usr/local/bin/v
 
 # Install the vanilla HTTP server as the `vanilla` module (import vanilla.http_server).
-# The ADD fetches vanilla's main ref first, so Docker invalidates this layer's
-# cache whenever main moves — otherwise the clone layer is cached indefinitely and
-# the build never picks up upstream library fixes.
-ADD https://api.github.com/repos/enghitalo/vanilla/git/refs/heads/main /tmp/vanilla-main-ref.json
-RUN git clone --depth 1 https://github.com/enghitalo/vanilla /root/.vmodules/vanilla
+# The ADD fetches the pinned ref first, so Docker invalidates this layer's cache
+# whenever that ref moves — otherwise the clone layer is cached indefinitely and
+# the build never picks up library fixes.
+# TEMPORARY: pinned to the cross-request pipelining branch (vanilla PR #45) so this
+# arena PR can benchmark before #45 merges. Revert to refs/heads/main once #45 lands.
+ADD https://api.github.com/repos/enghitalo/vanilla/git/refs/heads/feat/pg-async-pipelining /tmp/vanilla-pipelining-ref.json
+RUN git clone --depth 1 --branch feat/pg-async-pipelining https://github.com/enghitalo/vanilla /root/.vmodules/vanilla
 
 WORKDIR /app
 COPY . .
