@@ -59,14 +59,29 @@ struct StaticFile {
 
 fn C.open(pathname &char, flags int) int
 
+const crud_shard_count = 256 // power of two; `id & (n-1)` picks the shard
+
+// CrudShard is one stripe of the crud cache-aside. Sharding by `id & (n-1)`
+// spreads the per-GET rlock across `n` locks so the 128 worker cores don't
+// ping-pong a single RwMutex's cache line on every hit (that MESI bouncing, not
+// the map lookup, is the dominant cost on the small-response cache-HIT path).
+struct CrudShard {
+mut:
+	mu    &sync.RwMutex = unsafe { nil }
+	items map[int][]u8 // id -> the FULL `X-Cache: HIT` response bytes (one push_many on a hit)
+}
+
 struct Shared {
 mut:
-	pool     pg.ConnectionPool
-	dataset  []DatasetItem
-	prefixes []string // per item: `{…,"total":` (everything but the request-dependent total)
-	assets   map[string]StaticFile // /static/<name> -> prebuilt response
-	cache    map[int]string        // crud cache-aside: id -> item JSON
-	cache_mu &sync.RwMutex = unsafe { nil }
+	pool        pg.ConnectionPool
+	dataset     []DatasetItem
+	prefixes    []string // per item: `{…,"total":` (everything but the request-dependent total)
+	assets      map[string]StaticFile // /static/<name> -> prebuilt response
+	crud_shards []CrudShard           // sharded crud cache-aside (full response bytes)
+	// /json (non-gzip) response cache: (count<<32)|m -> full response bytes. The
+	// 7 benchmarked (count,m) pairs are deterministic, so a hit is one push_many.
+	json_cache map[u64][]u8
+	json_mu    &sync.RwMutex = unsafe { nil }
 	// json-comp cache: the gzipped response for a given (count, m) is fully
 	// deterministic and gzip dominates the cost, so compress once and reuse.
 	// Key = (count << 32) | m. The benchmark hits only a few pairs, so it's tiny.
@@ -265,14 +280,12 @@ fn (mut sh Shared) crud_list(category string, page i64, limit i64) []u8 {
 // GC-churn waste on the hot cache-HIT path (back-ported from the async build,
 // where this same change is part of why crud ran 3x faster).
 fn (mut sh Shared) crud_get(id int, mut out []u8) {
-	sh.cache_mu.@rlock()
-	cached := sh.cache[id] or { '' }
-	sh.cache_mu.runlock()
+	mut shard := &sh.crud_shards[id & (crud_shard_count - 1)]
+	shard.mu.@rlock()
+	cached := shard.items[id] or { []u8{} }
+	shard.mu.runlock()
 	if cached.len > 0 {
-		ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
-		wi(mut out, i64(cached.len))
-		ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-		ws(mut out, cached)
+		wb(mut out, cached) // full HIT response — one push_many, no rebuild
 		return
 	}
 	mut conn := sh.pool.acquire() or {
@@ -291,9 +304,16 @@ fn (mut sh Shared) crud_get(id int, mut out []u8) {
 		return
 	}
 	body := json.encode(row_to_item(rows[0]))
-	sh.cache_mu.@lock()
-	sh.cache[id] = body
-	sh.cache_mu.unlock()
+	// Cache the FULL `X-Cache: HIT` response so future hits are a single blit.
+	mut hit := []u8{cap: body.len + 110}
+	ws(mut hit, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
+	wi(mut hit, i64(body.len))
+	ws(mut hit, '\r\nConnection: keep-alive\r\n\r\n')
+	ws(mut hit, body)
+	shard.mu.@lock()
+	shard.items[id] = hit
+	shard.mu.unlock()
+	// This (first) response carries MISS; identical bytes otherwise.
 	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: MISS\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, i64(body.len))
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
@@ -325,9 +345,10 @@ fn (mut sh Shared) crud_update(id int, req request_parser.HttpRequest) []u8 {
 		return bad_request
 	}
 	sh.pool.release(conn)
-	sh.cache_mu.@lock()
-	sh.cache.delete(id)
-	sh.cache_mu.unlock()
+	mut shard := &sh.crud_shards[id & (crud_shard_count - 1)]
+	shard.mu.@lock()
+	shard.items.delete(id)
+	shard.mu.unlock()
 	return ok('application/json', '{"status":"ok"}')
 }
 
@@ -381,7 +402,17 @@ const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Leng
 // single allocation — no per-request reflection and no body→response copy.
 // Only `total` (price*quantity*m) varies per request; the rest is a precomputed
 // prefix. Content-Length is computed up front so everything lands in one buffer.
-fn (sh &Shared) write_json_response(mut out []u8, count int, m i64) {
+fn (mut sh Shared) write_json_response(mut out []u8, count int, m i64) {
+	// Cache the full response for a (count,m) pair (7 hot pairs in the bench), so a
+	// hit is one push_many — no per-item prefix loop, no double price*qty*m pass.
+	key := (u64(u32(count)) << 32) | u64(u32(m))
+	sh.json_mu.@rlock()
+	cached := sh.json_cache[key] or { []u8{} }
+	sh.json_mu.runlock()
+	if cached.len > 0 {
+		wb(mut out, cached)
+		return
+	}
 	mut clen := 21 + digits(i64(count)) // len('{"items":[') + len('],"count":') + '}' + count digits
 	if count > 0 {
 		clen += count - 1 // item separators
@@ -390,19 +421,26 @@ fn (sh &Shared) write_json_response(mut out []u8, count int, m i64) {
 		t := sh.dataset[i].price * sh.dataset[i].quantity * m
 		clen += sh.prefixes[i].len + digits(t) + 1 // prefix + total + '}'
 	}
-	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
-	wi(mut out, i64(clen))
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"items":[')
+	mut resp := []u8{cap: clen + 128}
+	ws(mut resp, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
+	wi(mut resp, i64(clen))
+	ws(mut resp, '\r\nConnection: keep-alive\r\n\r\n{"items":[')
 	for i in 0 .. count {
-		ws(mut out, sh.prefixes[i])
-		wi(mut out, sh.dataset[i].price * sh.dataset[i].quantity * m)
+		ws(mut resp, sh.prefixes[i])
+		wi(mut resp, sh.dataset[i].price * sh.dataset[i].quantity * m)
 		// fuse each object's closing `}` with the item separator `,` into one
 		// bulk write — single-element `<<` is the slow path on post-0.5.1 V.
-		ws(mut out, if i < count - 1 { '},' } else { '}' })
+		ws(mut resp, if i < count - 1 { '},' } else { '}' })
 	}
-	ws(mut out, '],"count":')
-	wi(mut out, i64(count))
-	ws(mut out, '}')
+	ws(mut resp, '],"count":')
+	wi(mut resp, i64(count))
+	ws(mut resp, '}')
+	sh.json_mu.@lock()
+	if sh.json_cache.len < 1024 {
+		sh.json_cache[key] = resp
+	}
+	sh.json_mu.unlock()
+	wb(mut out, resp)
 }
 
 // write_json_gzip is the json-comp path. The gzipped response for a given
@@ -816,14 +854,18 @@ fn main() {
 	}
 
 	mut sh := Shared{
-		pool:     pool
-		dataset:  dataset
-		prefixes: prefixes
-		assets:   assets
-		cache:    map[int]string{}
-		cache_mu: sync.new_rwmutex()
-		gz_cache: map[u64][]u8{}
-		gz_mu:    sync.new_rwmutex()
+		pool:        pool
+		dataset:     dataset
+		prefixes:    prefixes
+		assets:      assets
+		crud_shards: []CrudShard{len: crud_shard_count, init: CrudShard{
+			mu:    sync.new_rwmutex()
+			items: map[int][]u8{}
+		}}
+		json_cache:  map[u64][]u8{}
+		json_mu:     sync.new_rwmutex()
+		gz_cache:    map[u64][]u8{}
+		gz_mu:       sync.new_rwmutex()
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
