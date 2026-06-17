@@ -434,7 +434,15 @@ fn (mut sh Shared) fortunes() string {
 		message: 'Additional fortune added at request time.'
 	}
 	fortunes.sort(a.message < b.message)
-	mut sb := strings.new_builder(32768)
+	// Size the builder to the actual content (~1.5 KB) instead of a flat 32 KB:
+	// callgrind showed the 32 KB allocation's zero-fill was ~26% of render cost
+	// (the GC reuses + re-zeroes the block every request). 96/row covers the
+	// markup, id digits, and modest HTML-escape expansion; an outlier grows once.
+	mut needed := 160
+	for f in fortunes {
+		needed += 96 + f.message.len
+	}
+	mut sb := strings.new_builder(needed)
 	sb.write_string('<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
 	for f in fortunes {
 		sb.write_string('<tr><td>')
