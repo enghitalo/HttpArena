@@ -273,14 +273,22 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 // render kind (+ id/page for the routes that need them) for the continuation.
 // On a pool/flush failure it answers synchronously with `fallback`.
 fn (mut w WorkerCtx) park(mut out []u8, mut ac core.AsyncCtx, query_text string, params []?[]u8, kind u8, id int, page i64, fallback []u8) core.AsyncStep {
-	idx := w.pool.acquire() or {
+	// Pick the least-loaded connection (shortest pipeline). Cross-request
+	// pipelining: a connection multiplexes up to max_inflight queries, so we shed
+	// only when every connection is at the cap — not when a connection is merely
+	// busy with one in-flight query (the old one-in-flight starvation).
+	idx := w.pool.acquire_pipelined() or {
 		wb(mut out, fallback)
 		return .done
 	}
 	mut c := w.pool.conn(idx)
-	c.async_submit(query_text, params)
+	// Append the query to the connection's pipeline; shed if the connection is
+	// saturated (ring or send buffer full) rather than block.
+	if !c.async_submit(query_text, params) {
+		wb(mut out, fallback)
+		return .done
+	}
 	c.async_flush() or {
-		w.pool.release(idx)
 		wb(mut out, fallback)
 		return .done
 	}
@@ -290,6 +298,9 @@ fn (mut w WorkerCtx) park(mut out []u8, mut ac core.AsyncCtx, query_text string,
 		id:       id
 		page:     page
 	}
+	// One watch per parked request on the connection's fd. When several requests
+	// share a connection the reactor auto-promotes the fd to a FIFO queue and fans
+	// each reply out in submission order (queue[k] ↔ the connection's inflight[k]).
 	ac.watch(w.pool.fd(idx), .readable, on_db_ready, voidptr(st))
 	return .suspend
 }
@@ -300,8 +311,11 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	mut w := unsafe { &WorkerCtx(ac.state) }
 	st := unsafe { &Stash(ac.udata) }
 	mut c := w.pool.conn(st.conn_idx)
+	// async_on_readable pops THIS request's reply: the reactor runs the connection's
+	// parked requests front-first and replies arrive in submit order, so the FIFO
+	// front the reactor hands us aligns with the query we submitted. A server error
+	// fails only this query (its own Sync bounds it); pipelined siblings continue.
 	poll := c.async_on_readable() or {
-		w.pool.release(st.conn_idx)
 		w.render_error(mut out, st.kind)
 		return .done
 	}
@@ -319,8 +333,9 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		k_crud_update { w.render_crud_update(mut out, st.id) }
 		else { wb(mut out, not_found) }
 	}
-
-	w.pool.release(st.conn_idx)
+	// No release: a pipelined connection is not held exclusively. Its in-flight
+	// count dropped when async_on_readable popped this reply, freeing a pipeline
+	// slot for acquire_pipelined.
 	return .done
 }
 
