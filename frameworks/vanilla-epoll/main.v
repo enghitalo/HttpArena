@@ -8,6 +8,7 @@ import json
 import os
 import runtime
 import strings
+import sync
 import compress.gzip
 
 struct Rating {
@@ -57,17 +58,25 @@ struct SharedRO {
 	dataset  []DatasetItem
 	prefixes []string
 	assets   map[string]StaticFile
+mut:
+	// PROCESS-SHARED caches (mutex-guarded). They must be shared, not per-worker:
+	// validate.sh does two GET /crud/items/42 and requires X-Cache MISS then HIT,
+	// but SO_REUSEPORT routes the two to different workers — per-worker caches MISS
+	// twice. The pool stays per-worker (no lock); only these caches are shared.
+	crud    map[int][]u8 // crud cache-aside: id -> full item response bytes
+	crud_mu &sync.RwMutex = unsafe { nil }
+	gz      map[u64][]u8 // json-comp: (count<<32)|m -> gzipped response bytes
+	gz_mu   &sync.RwMutex = unsafe { nil }
 }
 
 // WorkerCtx is the per-worker state handed to every handler call as ac.state
-// (the make_state contract). Each worker owns its own async Postgres pool and
-// its own caches — no cross-worker sharing, so no locks.
+// (the make_state contract). Each worker owns its own async Postgres pool (no
+// lock); the caches live in the shared `ro` (mutex-guarded) so X-Cache hits
+// survive SO_REUSEPORT routing the two probe requests to different workers.
 struct WorkerCtx {
 mut:
-	ro       &SharedRO        = unsafe { nil }
-	pool     &pg_async.PgPool = unsafe { nil }
-	cache    map[int][]u8 // crud cache-aside: id -> full item response bytes
-	gz_cache map[u64][]u8 // json-comp: (count<<32)|m -> gzipped response bytes
+	ro   &SharedRO        = unsafe { nil } // shared data + process-shared caches
+	pool &pg_async.PgPool = unsafe { nil } // per-worker async PG pool (no lock)
 }
 
 // Stash is the per-request state that must survive across the park (the request
@@ -312,12 +321,22 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 
 fn (w &WorkerCtx) render_error(mut out []u8, kind u8) {
 	match kind {
-		k_async_db { write_resp(mut out, 'application/json', '{"items":[],"count":0}') }
-		k_fortunes { write_resp(mut out, 'text/html; charset=utf-8',
-				'<!doctype html><html><body><table></table></body></html>') }
-		k_crud_list { write_resp(mut out, 'application/json', '{"items":[],"total":0,"page":1}') }
-		k_crud_get { wb(mut out, not_found) }
-		else { wb(mut out, bad_request) }
+		k_async_db {
+			write_resp(mut out, 'application/json', '{"items":[],"count":0}')
+		}
+		k_fortunes {
+			write_resp(mut out, 'text/html; charset=utf-8',
+				'<!doctype html><html><body><table></table></body></html>')
+		}
+		k_crud_list {
+			write_resp(mut out, 'application/json', '{"items":[],"total":0,"page":1}')
+		}
+		k_crud_get {
+			wb(mut out, not_found)
+		}
+		else {
+			wb(mut out, bad_request)
+		}
 	}
 }
 
@@ -467,7 +486,15 @@ fn render_crud_list(mut out []u8, res pg_async.Result, page i64) {
 }
 
 fn (mut w WorkerCtx) start_crud_get(mut out []u8, mut ac core.AsyncCtx, id int) core.AsyncStep {
-	if cached := w.cache[id] {
+	mut cached := []u8{}
+	w.ro.crud_mu.@rlock()
+	if c := w.ro.crud[id] {
+		unsafe {
+			cached = c
+		} // hold the ref (GC-alive; stored entries are never mutated in place)
+	}
+	w.ro.crud_mu.runlock()
+	if cached.len > 0 {
 		// Cache hit: answer synchronously, no DB round-trip.
 		ws(mut out,
 			'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
@@ -490,7 +517,9 @@ fn (mut w WorkerCtx) render_crud_get(mut out []u8, res pg_async.Result, id int) 
 	}
 	mut item := []u8{cap: 512}
 	render_item(mut item, row)
-	w.cache[id] = item // populate the per-worker cache-aside
+	w.ro.crud_mu.@lock()
+	w.ro.crud[id] = item // populate the process-shared cache-aside
+	w.ro.crud_mu.unlock()
 	ws(mut out,
 		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: MISS\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, i64(item.len))
@@ -525,7 +554,9 @@ fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id in
 }
 
 fn (mut w WorkerCtx) render_crud_update(mut out []u8, id int) {
-	w.cache.delete(id) // invalidate the cache-aside entry
+	w.ro.crud_mu.@lock()
+	w.ro.crud.delete(id) // invalidate the cache-aside entry
+	w.ro.crud_mu.unlock()
 	write_resp(mut out, 'application/json', '{"status":"ok"}')
 }
 
@@ -557,7 +588,15 @@ fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
 
 fn (mut w WorkerCtx) write_json_gzip(mut out []u8, count int, m i64) {
 	key := (u64(u32(count)) << 32) | u64(u32(m))
-	if cached := w.gz_cache[key] {
+	mut cached := []u8{}
+	w.ro.gz_mu.@rlock()
+	if c := w.ro.gz[key] {
+		unsafe {
+			cached = c
+		}
+	}
+	w.ro.gz_mu.runlock()
+	if cached.len > 0 {
 		wb(mut out, cached)
 		return
 	}
@@ -572,9 +611,11 @@ fn (mut w WorkerCtx) write_json_gzip(mut out []u8, count int, m i64) {
 	wi(mut resp, i64(gz.len))
 	ws(mut resp, '\r\nConnection: keep-alive\r\n\r\n')
 	unsafe { resp.push_many(gz.data, gz.len) }
-	if w.gz_cache.len < 1024 {
-		w.gz_cache[key] = resp
+	w.ro.gz_mu.@lock()
+	if w.ro.gz.len < 1024 {
+		w.ro.gz[key] = resp
 	}
+	w.ro.gz_mu.unlock()
 	wb(mut out, resp)
 }
 
@@ -827,6 +868,10 @@ fn main() {
 		dataset:  dataset
 		prefixes: prefixes
 		assets:   assets
+		crud:     map[int][]u8{}
+		crud_mu:  sync.new_rwmutex()
+		gz:       map[u64][]u8{}
+		gz_mu:    sync.new_rwmutex()
 	}
 
 	mut server := http_server.new_server(http_server.ServerConfig{
@@ -841,10 +886,8 @@ fn main() {
 				panic('vanilla-epoll: pg pool bring-up failed: ${err}')
 			}
 			w := &WorkerCtx{
-				ro:       ro
-				pool:     pool
-				cache:    map[int][]u8{}
-				gz_cache: map[u64][]u8{}
+				ro:   ro
+				pool: pool
 			}
 			return voidptr(w)
 		}
