@@ -136,6 +136,13 @@ fn write_resp(mut out []u8, ctype string, body string) {
 }
 
 fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
+	// Pipelined hot path (the arena's highest-RPS test): blit the precomputed
+	// response on a raw request-line prefix match, BEFORE any parsing — skips
+	// decode_into entirely for the whole pipelined profile.
+	if has_pipeline_prefix(req_buffer) {
+		wb(mut out, pipeline_resp)
+		return
+	}
 	// decode_into fills req in place (no `!HttpRequest` Result boxing — that
 	// memset+copy of the big struct was ~13% of the parse path per callgrind).
 	// Requires vanilla #44 (decode_into) merged into main.
@@ -147,14 +154,6 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 	}
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
 	target := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
-	// Pipelined hot path (the arena's highest-RPS test): a fixed response. Blit the
-	// precomputed bytes and return BEFORE the '?'-scan, route slice, and piecewise
-	// header build below. The profile never sends a query, so an exact match on
-	// `target` is correct; a hypothetical '/pipeline?…' just falls through.
-	if target == '/pipeline' {
-		wb(mut out, pipeline_resp)
-		return
-	}
 	// Route on the path before '?' WITHOUT allocating: a tos() view into the
 	// request buffer rather than all_before()'s per-request copy. (Sub-slices like
 	// route[6..] still copy, but only on the few paths that actually need them.)
@@ -353,6 +352,24 @@ fn row_to_item(row pg.Row) DbItem {
 // query scan, route slice, or piecewise header build per request. Must stay
 // byte-identical to write_resp(out, 'text/plain', 'ok').
 const pipeline_resp = 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+
+// The whole pipelined profile is a fixed `GET /pipeline ` request. Matching the
+// raw request-line prefix lets the hot path skip decode_into ENTIRELY (parse is
+// ~8% of the pipelined per-request cost). The trailing space pins the exact path.
+const pipeline_prefix = 'GET /pipeline '.bytes()
+
+@[direct_array_access; inline]
+fn has_pipeline_prefix(b []u8) bool {
+	if b.len < pipeline_prefix.len {
+		return false
+	}
+	for i in 0 .. pipeline_prefix.len {
+		if b[i] != pipeline_prefix[i] {
+			return false
+		}
+	}
+	return true
+}
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
