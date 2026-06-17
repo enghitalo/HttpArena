@@ -136,7 +136,15 @@ fn write_resp(mut out []u8, ctype string, body string) {
 }
 
 fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+	// decode_into fills req in place (no `!HttpRequest` Result boxing — that
+	// memset+copy of the big struct was ~13% of the parse path per callgrind).
+	// Requires vanilla #44 (decode_into) merged into main.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
+		return error('bad request')
+	}
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
 	target := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
 	// Pipelined hot path (the arena's highest-RPS test): a fixed response. Blit the
