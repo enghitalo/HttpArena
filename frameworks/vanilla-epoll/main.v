@@ -211,7 +211,7 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 		if method == 'PUT' {
 			wb(mut out, sh.crud_update(id, req))
 		} else {
-			wb(mut out, sh.crud_get(id))
+			sh.crud_get(id, mut out)
 		}
 	} else {
 		wb(mut out, not_found)
@@ -260,28 +260,45 @@ fn (mut sh Shared) crud_list(category string, page i64, limit i64) []u8 {
 
 // crud_get returns a single item, using a cache-aside in-memory cache and
 // reporting the result via the X-Cache header (MISS on first read, HIT after).
-fn (mut sh Shared) crud_get(id int) []u8 {
+// crud_get writes the response straight into `out` (the dominant crud path is the
+// cached GET, ~75% of the mix). Writing direct via ws/wi avoids ok_xcache's
+// per-hit strings.Builder alloc + materialized []u8 + the wb double-copy — pure
+// GC-churn waste on the hot cache-HIT path (back-ported from the async build,
+// where this same change is part of why crud ran 3x faster).
+fn (mut sh Shared) crud_get(id int, mut out []u8) {
 	sh.cache_mu.@rlock()
 	cached := sh.cache[id] or { '' }
 	sh.cache_mu.runlock()
 	if cached.len > 0 {
-		return ok_xcache('application/json', cached, 'HIT')
+		ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: HIT\r\nContent-Type: application/json\r\nContent-Length: ')
+		wi(mut out, i64(cached.len))
+		ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+		ws(mut out, cached)
+		return
 	}
-	mut conn := sh.pool.acquire() or { return not_found }
+	mut conn := sh.pool.acquire() or {
+		wb(mut out, not_found)
+		return
+	}
 	rows := conn.exec_param_many('SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
 		[id.str()]) or {
 		sh.pool.release(conn)
-		return not_found
+		wb(mut out, not_found)
+		return
 	}
 	sh.pool.release(conn)
 	if rows.len == 0 {
-		return not_found
+		wb(mut out, not_found)
+		return
 	}
 	body := json.encode(row_to_item(rows[0]))
 	sh.cache_mu.@lock()
 	sh.cache[id] = body
 	sh.cache_mu.unlock()
-	return ok_xcache('application/json', body, 'MISS')
+	ws(mut out, 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nX-Cache: MISS\r\nContent-Type: application/json\r\nContent-Length: ')
+	wi(mut out, i64(body.len))
+	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+	ws(mut out, body)
 }
 
 // crud_create inserts a new item from the JSON body and returns 201.
