@@ -195,7 +195,12 @@ const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Leng
 
 fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	mut w := unsafe { &WorkerCtx(ac.state) }
-	req := request_parser.decode_http_request(req_buffer) or {
+	// decode_into fills req in place — no `!HttpRequest` Result boxing (~13% of the
+	// parse path per callgrind), the same no-boxing entry the sync build uses.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		wb(mut out, bad_request)
 		return .done
 	}
@@ -820,8 +825,15 @@ fn main() {
 	url := os.getenv_opt('DATABASE_URL') or { 'postgres://bench:bench@localhost:5432/benchmark' }
 	cfg := parse_db_url(url)
 
-	// DATABASE_MAX_CONN is the TOTAL connection budget; split it across the
-	// thread-per-core workers (each worker owns its own pool, 1..8 connections).
+	// DATABASE_MAX_CONN is the TOTAL connection budget (sized to Postgres
+	// max_connections); split it evenly across the thread-per-core workers, each
+	// owning its own pool. Each pooled conn carries ONE in-flight query (no
+	// pipelining-while-busy), and the load is closed-loop with ~connections/workers
+	// clients per worker — so the per-worker pool IS the per-worker concurrency
+	// ceiling. A previous `min(8)` clamp wasted half the 256 budget (16 workers ->
+	// 8 = 128) and starved the DB endpoints: when the pool is full, park() sheds the
+	// request as an empty 200, so the closed-loop clients just spin and throughput
+	// collapses. Use the FULL budget (256/16 = 16/worker) — do not re-cap below it.
 	mut total := (os.getenv_opt('DATABASE_MAX_CONN') or { '64' }).int()
 	if total < 1 {
 		total = 64
@@ -830,9 +842,6 @@ fn main() {
 	mut per_worker := total / workers
 	if per_worker < 1 {
 		per_worker = 1
-	}
-	if per_worker > 8 {
-		per_worker = 8
 	}
 
 	dataset_path := os.getenv_opt('DATASET_PATH') or { '/data/dataset.json' }
