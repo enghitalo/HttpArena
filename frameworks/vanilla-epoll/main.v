@@ -77,6 +77,12 @@ struct WorkerCtx {
 mut:
 	ro   &SharedRO        = unsafe { nil } // shared data + process-shared caches
 	pool &pg_async.PgPool = unsafe { nil } // per-worker async PG pool (no lock)
+	// scratch is this worker's REUSED render buffer: render_* build the JSON/HTML body
+	// here (reset to len 0 each response, grows to a high-water mark then stays) rather
+	// than allocating a fresh []u8 per request. The binary ships `-gc none`, so a
+	// per-request body buffer would never be freed — a multi-GiB leak under load. One
+	// buffer is safe because a worker serves requests one at a time (no concurrency).
+	scratch []u8
 }
 
 // Stash is the per-request state that must survive across the park (the request
@@ -360,9 +366,9 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	res := poll.result
 	match st.kind {
 		k_async_db { w.render_async_db(mut out, res) }
-		k_fortunes { render_fortunes(mut out, res) }
+		k_fortunes { w.render_fortunes(mut out, res) }
 		k_crud_get { w.render_crud_get(mut out, res, st.id) }
-		k_crud_list { render_crud_list(mut out, res, st.page) }
+		k_crud_list { w.render_crud_list(mut out, res, st.page) }
 		k_crud_create { wb(mut out, created) }
 		k_crud_update { w.render_crud_update(mut out, st.id) }
 		else { wb(mut out, not_found) }
@@ -411,23 +417,23 @@ fn (mut w WorkerCtx) start_async_db(mut out []u8, mut ac core.AsyncCtx, min i64,
 		'{"items":[],"count":0}'.bytes())
 }
 
-fn (w &WorkerCtx) render_async_db(mut out []u8, res pg_async.Result) {
-	mut body := []u8{cap: 4096}
-	ws(mut body, '{"items":[')
+fn (mut w WorkerCtx) render_async_db(mut out []u8, res pg_async.Result) {
+	unsafe { w.scratch.len = 0 } // reuse the worker's render buffer (no per-request alloc)
+	ws(mut w.scratch, '{"items":[')
 	mut rows := res.rows()
 	mut count := 0
 	for {
 		row := rows.next() or { break }
 		if count > 0 {
-			ws(mut body, ',')
+			ws(mut w.scratch, ',')
 		}
-		render_item(mut body, row)
+		render_item(mut w.scratch, row)
 		count++
 	}
-	ws(mut body, '],"count":')
-	wi(mut body, i64(count))
-	ws(mut body, '}')
-	emit(mut out, 'application/json', body)
+	ws(mut w.scratch, '],"count":')
+	wi(mut w.scratch, i64(count))
+	ws(mut w.scratch, '}')
+	emit(mut out, 'application/json', w.scratch)
 }
 
 // render_item writes one items-row as JSON. tags is JSONB read in binary: a
@@ -463,7 +469,7 @@ fn (mut w WorkerCtx) start_fortunes(mut out []u8, mut ac core.AsyncCtx) core.Asy
 		'<!doctype html><html><body><table></table></body></html>'.bytes())
 }
 
-fn render_fortunes(mut out []u8, res pg_async.Result) {
+fn (mut w WorkerCtx) render_fortunes(mut out []u8, res pg_async.Result) {
 	mut fortunes := []Fortune{}
 	mut rows := res.rows()
 	for {
@@ -478,18 +484,18 @@ fn render_fortunes(mut out []u8, res pg_async.Result) {
 		message: 'Additional fortune added at request time.'
 	}
 	fortunes.sort(a.message < b.message)
-	mut body := []u8{cap: 32768}
-	ws(mut body,
+	unsafe { w.scratch.len = 0 } // reuse the worker's render buffer (no per-request body alloc)
+	ws(mut w.scratch,
 		'<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
 	for f in fortunes {
-		ws(mut body, '<tr><td>')
-		wi(mut body, i64(f.id))
-		ws(mut body, '</td><td>')
-		ws(mut body, escape_html(f.message))
-		ws(mut body, '</td></tr>')
+		ws(mut w.scratch, '<tr><td>')
+		wi(mut w.scratch, i64(f.id))
+		ws(mut w.scratch, '</td><td>')
+		ws(mut w.scratch, escape_html(f.message))
+		ws(mut w.scratch, '</td></tr>')
 	}
-	ws(mut body, '</table></body></html>')
-	emit(mut out, 'text/html; charset=utf-8', body)
+	ws(mut w.scratch, '</table></body></html>')
+	emit(mut out, 'text/html; charset=utf-8', w.scratch)
 }
 
 // ── /crud ────────────────────────────────────────────────────────────────────
@@ -516,27 +522,27 @@ fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, categor
 		'{"items":[],"total":0,"page":1}'.bytes())
 }
 
-fn render_crud_list(mut out []u8, res pg_async.Result, page i64) {
-	mut body := []u8{cap: 8192}
-	ws(mut body, '{"items":[')
+fn (mut w WorkerCtx) render_crud_list(mut out []u8, res pg_async.Result, page i64) {
+	unsafe { w.scratch.len = 0 } // reuse the worker's render buffer (no per-request alloc)
+	ws(mut w.scratch, '{"items":[')
 	mut rows := res.rows()
 	mut count := 0
 	mut total := i64(0)
 	for {
 		row := rows.next() or { break }
 		if count > 0 {
-			ws(mut body, ',')
+			ws(mut w.scratch, ',')
 		}
-		render_item(mut body, row)
+		render_item(mut w.scratch, row)
 		total = row.int8(9) or { 0 } // count(*) OVER() — same in every row
 		count++
 	}
-	ws(mut body, '],"total":')
-	wi(mut body, total)
-	ws(mut body, ',"page":')
-	wi(mut body, page)
-	ws(mut body, '}')
-	emit(mut out, 'application/json', body)
+	ws(mut w.scratch, '],"total":')
+	wi(mut w.scratch, total)
+	ws(mut w.scratch, ',"page":')
+	wi(mut w.scratch, page)
+	ws(mut w.scratch, '}')
+	emit(mut out, 'application/json', w.scratch)
 }
 
 fn (mut w WorkerCtx) start_crud_get(mut out []u8, mut ac core.AsyncCtx, id int) core.AsyncStep {
@@ -944,8 +950,9 @@ fn main() {
 				panic('vanilla-epoll: pg pool bring-up failed: ${err}')
 			}
 			w := &WorkerCtx{
-				ro:   ro
-				pool: pool
+				ro:      ro
+				pool:    pool
+				scratch: []u8{cap: 32 * 1024} // reused render buffer (see WorkerCtx.scratch)
 			}
 			return voidptr(w)
 		}
