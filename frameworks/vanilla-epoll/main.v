@@ -48,7 +48,7 @@ struct CrudCreate {
 
 struct Fortune {
 	id      int
-	message string
+	message []u8 // BORROWED view into the Result frames buffer (valid during render only)
 }
 
 // SharedRO is the immutable, process-wide data: the dataset, the precomputed
@@ -83,12 +83,32 @@ mut:
 	// per-request body buffer would never be freed — a multi-GiB leak under load. One
 	// buffer is safe because a worker serves requests one at a time (no concurrency).
 	scratch []u8
+	// Reused per-request DB-param buffers (same -gc none / single-threaded rationale as
+	// scratch). param_scratch holds integer params serialized as decimal bytes;
+	// params_buf is the []?[]u8 handed to park(), refilled each request with borrowed
+	// slices into param_scratch (ints) and into the request buffer (strings). Both are
+	// reset (len 0) per request and consumed synchronously inside park→async_submit
+	// (write_bind copies the bytes), so the borrows never outlive the call.
+	// INVARIANT: param_scratch.cap (256) must exceed the worst-case decimal bytes of one
+	// request's int params (≤5 × 20 digits = 100) so it never reallocates mid-request —
+	// a realloc would dangle the earlier slices already pushed into params_buf.
+	param_scratch []u8
+	params_buf    []?[]u8
+	// Reused Stash free-list: park() borrows a Stash here instead of heap-allocating one
+	// per request; on_db_ready returns it on the terminal .done path only (NOT on the
+	// not-ready re-arm, where it stays live as the watch udata — incl. a FIX 3 dead
+	// tombstone that keeps it referenced until its orphaned reply drains).
+	stash_pool []&Stash
+	// Reused /fortunes row buffer: messages are BORROWED views into the Result frames
+	// (stable during the synchronous render), not bytestr().clone()'d.
+	fortunes_buf []Fortune
 }
 
 // Stash is the per-request state that must survive across the park (the request
 // buffer is recycled while a query is in flight). One small heap struct per DB
 // request; the single resume continuation switches on `kind`.
 struct Stash {
+mut:
 	kind     u8
 	conn_idx int
 	id       int
@@ -290,8 +310,8 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		if method == 'POST' {
 			return w.start_crud_create(mut out, mut ac, req)
 		}
-		return w.start_crud_list(mut out, mut ac, qstr(req, qk_category), qint(req, qk_page), qint(req,
-			qk_limit))
+		return w.start_crud_list(mut out, mut ac, qstr_slice(req, qk_category), qint(req, qk_page),
+			qint(req, qk_limit))
 	} else if route.starts_with('/crud/items/') {
 		id := int(parse_u_at(route, 12))
 		if method == 'PUT' {
@@ -326,11 +346,24 @@ fn (mut w WorkerCtx) park(mut out []u8, mut ac core.AsyncCtx, query_text string,
 		wb(mut out, fallback)
 		return .done
 	}
-	st := &Stash{
-		kind:     kind
-		conn_idx: idx
-		id:       id
-		page:     page
+	// Borrow a Stash from the per-worker free-list instead of heap-allocating one per
+	// request (a leak under -gc none). on_db_ready returns it on the terminal .done path.
+	// Statement form (not `mut st := if ... { } else { &Stash{} }`): a `&Struct{}` literal
+	// as an if-EXPRESSION branch miscompiles to invalid C under -g (cf. vlang/v#27485).
+	mut st := &Stash(unsafe { nil })
+	if w.stash_pool.len > 0 {
+		st = w.stash_pool.pop()
+		st.kind = kind
+		st.conn_idx = idx
+		st.id = id
+		st.page = page
+	} else {
+		st = &Stash{
+			kind:     kind
+			conn_idx: idx
+			id:       id
+			page:     page
+		}
 	}
 	// One watch per parked request on the connection's fd. When several requests
 	// share a connection the reactor auto-promotes the fd to a FIFO queue and fans
@@ -354,12 +387,15 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	// fails only this query (its own Sync bounds it); pipelined siblings continue.
 	poll := c.async_on_readable() or {
 		w.render_error(mut out, st.kind)
+		w.return_stash(st) // terminal .done — recycle the Stash
 		return .done
 	}
 	if !poll.ready {
 		// Re-arm persistent: the single-watch path clears the slot before running this
 		// continuation, so the re-arm is a fresh entry — watch_persistent re-stamps the
 		// pool-owned flag that a plain watch would drop. (more bytes to come)
+		// NOTE: do NOT recycle st here — it stays live as the watch udata (incl. a FIX 3
+		// dead tombstone) until the reply completes on a later edge.
 		ac.watch_persistent(w.pool.fd(st.conn_idx), .readable, on_db_ready, ac.udata)
 		return .suspend
 	}
@@ -376,7 +412,18 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	// No release: a pipelined connection is not held exclusively. Its in-flight
 	// count dropped when async_on_readable popped this reply, freeing a pipeline
 	// slot for acquire_pipelined.
+	w.return_stash(st) // terminal .done — recycle the Stash
 	return .done
+}
+
+// return_stash recycles a finished request's Stash onto the per-worker free-list. Call
+// ONLY on a terminal .done path — never on the .suspend re-arm, where st stays live as
+// the watch udata. Bounded so a burst doesn't grow the list without limit.
+@[inline]
+fn (mut w WorkerCtx) return_stash(st &Stash) {
+	if w.stash_pool.len < 64 {
+		w.stash_pool << st
+	}
 }
 
 fn (w &WorkerCtx) render_error(mut out []u8, kind u8) {
@@ -400,6 +447,41 @@ fn (w &WorkerCtx) render_error(mut out []u8, kind u8) {
 	}
 }
 
+// ── Bind-param builders (zero per-request allocation) ────────────────────────
+// Each start_* builds its params into the worker's reused params_buf via these
+// helpers instead of a fresh `[?[]u8(x.str().bytes()), ...]` literal (which leaked
+// the array + every .str()/.bytes() under -gc none). Call reset_params(), push each
+// param in $1..$N order, then pass w.params_buf to park().
+
+@[inline]
+fn (mut w WorkerCtx) reset_params() {
+	unsafe {
+		w.param_scratch.len = 0
+		w.params_buf.len = 0
+	}
+}
+
+// push_int serializes i64 n as decimal into param_scratch and pushes a borrowed slice
+// onto params_buf. Relies on param_scratch NOT reallocating mid-request (cap ≫ worst
+// case, see WorkerCtx) — a realloc would dangle slices already pushed.
+fn (mut w WorkerCtx) push_int(n i64) {
+	old := w.param_scratch.len
+	wi(mut w.param_scratch, n)
+	w.params_buf << ?[]u8(w.param_scratch[old..w.param_scratch.len])
+}
+
+// push_bytes pushes a borrowed, non-NULL byte param (a request-buffer or decoded-string
+// view) onto params_buf. The bytes are copied by write_bind synchronously in park.
+@[inline]
+fn (mut w WorkerCtx) push_bytes(b []u8) {
+	w.params_buf << ?[]u8(b)
+}
+
+// Shed-path fallback bodies, computed once (a literal `.bytes()` per request would leak).
+const adb_fallback = '{"items":[],"count":0}'.bytes()
+const crud_list_fallback = '{"items":[],"total":0,"page":1}'.bytes()
+const fortunes_fallback = '<!doctype html><html><body><table></table></body></html>'.bytes()
+
 // ── /async-db ────────────────────────────────────────────────────────────────
 
 const async_db_sql = 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN \$1 AND \$2 LIMIT \$3'
@@ -412,9 +494,11 @@ fn (mut w WorkerCtx) start_async_db(mut out []u8, mut ac core.AsyncCtx, min i64,
 	if lim > 50 {
 		lim = 50
 	}
-	params := [?[]u8(min.str().bytes()), ?[]u8(max.str().bytes()), ?[]u8(lim.str().bytes())]
-	return w.park(mut out, mut ac, async_db_sql, params, k_async_db, 0, 0,
-		'{"items":[],"count":0}'.bytes())
+	w.reset_params()
+	w.push_int(min)
+	w.push_int(max)
+	w.push_int(lim)
+	return w.park(mut out, mut ac, async_db_sql, w.params_buf, k_async_db, 0, 0, adb_fallback)
 }
 
 fn (mut w WorkerCtx) render_async_db(mut out []u8, res pg_async.Result) {
@@ -465,37 +549,55 @@ fn render_item(mut body []u8, row pg_async.Row) {
 // ── /fortunes ────────────────────────────────────────────────────────────────
 
 fn (mut w WorkerCtx) start_fortunes(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	return w.park(mut out, mut ac, 'SELECT id, message FROM fortune', []?[]u8{}, k_fortunes, 0, 0,
-		'<!doctype html><html><body><table></table></body></html>'.bytes())
+	w.reset_params() // no params; reuse the (empty) params_buf rather than a fresh literal
+	return w.park(mut out, mut ac, 'SELECT id, message FROM fortune', w.params_buf, k_fortunes,
+		0, 0, fortunes_fallback)
 }
 
+const synthetic_fortune = 'Additional fortune added at request time.'.bytes()
+
 fn (mut w WorkerCtx) render_fortunes(mut out []u8, res pg_async.Result) {
-	mut fortunes := []Fortune{}
+	unsafe { w.fortunes_buf.len = 0 } // reuse the worker's row buffer (no per-request vector)
 	mut rows := res.rows()
 	for {
 		row := rows.next() or { break }
-		fortunes << Fortune{
+		// BORROW the message bytes from the Result frames (stable for this synchronous
+		// render) — no bytestr().clone() (two allocs/row under -gc none).
+		w.fortunes_buf << Fortune{
 			id:      row.int4(0) or { 0 }
-			message: (row.text(1) or { ''.bytes() }).bytestr().clone()
+			message: row.text(1) or { []u8{} }
 		}
 	}
-	fortunes << Fortune{
+	w.fortunes_buf << Fortune{
 		id:      0
-		message: 'Additional fortune added at request time.'
+		message: synthetic_fortune
 	}
-	fortunes.sort(a.message < b.message)
+	w.fortunes_buf.sort_with_compare(cmp_fortune_message)
 	unsafe { w.scratch.len = 0 } // reuse the worker's render buffer (no per-request body alloc)
 	ws(mut w.scratch,
 		'<!doctype html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>')
-	for f in fortunes {
+	for f in w.fortunes_buf {
 		ws(mut w.scratch, '<tr><td>')
 		wi(mut w.scratch, i64(f.id))
 		ws(mut w.scratch, '</td><td>')
-		ws(mut w.scratch, escape_html(f.message))
+		escape_html_into(mut w.scratch, f.message) // escape directly into scratch (no Builder)
 		ws(mut w.scratch, '</td></tr>')
 	}
 	ws(mut w.scratch, '</table></body></html>')
 	emit(mut out, 'text/html; charset=utf-8', w.scratch)
+}
+
+// cmp_fortune_message orders fortunes by message, lexicographically by bytes — V has no
+// `<` on []u8, so the sort needs an explicit comparator (returns <0 / 0 / >0).
+fn cmp_fortune_message(a &Fortune, b &Fortune) int {
+	mut i := 0
+	for i < a.message.len && i < b.message.len {
+		if a.message[i] != b.message[i] {
+			return int(a.message[i]) - int(b.message[i])
+		}
+		i++
+	}
+	return a.message.len - b.message.len
 }
 
 // ── /crud ────────────────────────────────────────────────────────────────────
@@ -504,7 +606,7 @@ fn (mut w WorkerCtx) render_fortunes(mut out []u8, res pg_async.Result) {
 // the total come back together — one park instead of two queries.
 const crud_list_sql = 'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count, count(*) OVER() FROM items WHERE category = \$1 ORDER BY id LIMIT \$2 OFFSET \$3'
 
-fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, category string, page i64, limit i64) core.AsyncStep {
+fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, category []u8, page i64, limit i64) core.AsyncStep {
 	mut p := page
 	if p < 1 {
 		p = 1
@@ -517,9 +619,11 @@ fn (mut w WorkerCtx) start_crud_list(mut out []u8, mut ac core.AsyncCtx, categor
 		lim = 100
 	}
 	offset := (p - 1) * lim
-	params := [?[]u8(category.bytes()), ?[]u8(lim.str().bytes()), ?[]u8(offset.str().bytes())]
-	return w.park(mut out, mut ac, crud_list_sql, params, k_crud_list, 0, p,
-		'{"items":[],"total":0,"page":1}'.bytes())
+	w.reset_params()
+	w.push_bytes(category) // borrowed view into the request buffer (qstr_slice)
+	w.push_int(lim)
+	w.push_int(offset)
+	return w.park(mut out, mut ac, crud_list_sql, w.params_buf, k_crud_list, 0, p, crud_list_fallback)
 }
 
 fn (mut w WorkerCtx) render_crud_list(mut out []u8, res pg_async.Result, page i64) {
@@ -563,10 +667,11 @@ fn (mut w WorkerCtx) start_crud_get(mut out []u8, mut ac core.AsyncCtx, id int) 
 		wb(mut out, cached)
 		return .done
 	}
-	params := [?[]u8(id.str().bytes())]
+	w.reset_params()
+	w.push_int(i64(id))
 	return w.park(mut out, mut ac,
 		'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
-		params, k_crud_get, id, 0, not_found)
+		w.params_buf, k_crud_get, id, 0, not_found)
 }
 
 fn (mut w WorkerCtx) render_crud_get(mut out []u8, res pg_async.Result, id int) {
@@ -593,11 +698,15 @@ fn (mut w WorkerCtx) start_crud_create(mut out []u8, mut ac core.AsyncCtx, req r
 		wb(mut out, bad_request)
 		return .done
 	}
-	params := [?[]u8(c.id.str().bytes()), ?[]u8(c.name.bytes()), ?[]u8(c.category.bytes()),
-		?[]u8(c.price.str().bytes()), ?[]u8(c.quantity.str().bytes())]
+	w.reset_params()
+	w.push_int(i64(c.id))
+	w.push_bytes(unsafe { c.name.str.vbytes(c.name.len) }) // borrow decoded-string bytes
+	w.push_bytes(unsafe { c.category.str.vbytes(c.category.len) })
+	w.push_int(i64(c.price))
+	w.push_int(i64(c.quantity))
 	return w.park(mut out, mut ac,
 		"INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
-		params, k_crud_create, 0, 0, bad_request)
+		w.params_buf, k_crud_create, 0, 0, bad_request)
 }
 
 fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id int, req request_parser.HttpRequest) core.AsyncStep {
@@ -606,11 +715,15 @@ fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id in
 		wb(mut out, bad_request)
 		return .done
 	}
-	params := [?[]u8(id.str().bytes()), ?[]u8(c.name.bytes()), ?[]u8(c.category.bytes()),
-		?[]u8(c.price.str().bytes()), ?[]u8(c.quantity.str().bytes())]
+	w.reset_params()
+	w.push_int(i64(id))
+	w.push_bytes(unsafe { c.name.str.vbytes(c.name.len) }) // borrow decoded-string bytes
+	w.push_bytes(unsafe { c.category.str.vbytes(c.category.len) })
+	w.push_int(i64(c.price))
+	w.push_int(i64(c.quantity))
 	return w.park(mut out, mut ac,
 		'UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
-		params, k_crud_update, id, 0, bad_request)
+		w.params_buf, k_crud_update, id, 0, bad_request)
 }
 
 fn (mut w WorkerCtx) render_crud_update(mut out []u8, id int) {
@@ -698,7 +811,11 @@ fn (w &WorkerCtx) json_body(count int, m i64) string {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn escape_html(s string) string {
+// escape_html_into HTML-escapes s directly into out — no intermediate string/Builder
+// (escape_html allocated both per fortune row, leaking under -gc none). Fast path: when
+// nothing needs escaping, one bulk copy (the common case).
+@[direct_array_access]
+fn escape_html_into(mut out []u8, s []u8) {
 	mut needs := false
 	for c in s {
 		if c == `&` || c == `<` || c == `>` || c == `"` || c == `'` {
@@ -707,20 +824,19 @@ fn escape_html(s string) string {
 		}
 	}
 	if !needs {
-		return s
+		wb(mut out, s)
+		return
 	}
-	mut b := strings.new_builder(s.len + 16)
 	for c in s {
 		match c {
-			`&` { b.write_string('&amp;') }
-			`<` { b.write_string('&lt;') }
-			`>` { b.write_string('&gt;') }
-			`"` { b.write_string('&quot;') }
-			`'` { b.write_string('&apos;') }
-			else { b.write_u8(c) }
+			`&` { ws(mut out, '&amp;') }
+			`<` { ws(mut out, '&lt;') }
+			`>` { ws(mut out, '&gt;') }
+			`"` { ws(mut out, '&quot;') }
+			`'` { ws(mut out, '&apos;') }
+			else { unsafe { out.push_many(&c, 1) } }
 		}
 	}
-	return b.str()
 }
 
 fn digits(n i64) int {
@@ -745,14 +861,41 @@ const qk_limit = 'limit'.bytes()
 const qk_page = 'page'.bytes()
 const qk_category = 'category'.bytes()
 
+// qint parses an integer query parameter directly from the request buffer — no string
+// allocation (the old tos()+.i64() path materialized a throwaway string per call).
+@[direct_array_access]
 fn qint(req request_parser.HttpRequest, key []u8) i64 {
 	s := req.get_query_slice(key) or { return 0 }
-	return unsafe { tos(&req.buffer[s.start], s.len) }.i64()
+	return parse_i64_slice(req.buffer, s.start, s.len)
 }
 
-fn qstr(req request_parser.HttpRequest, key []u8) string {
-	s := req.get_query_slice(key) or { return '' }
-	return unsafe { tos(&req.buffer[s.start], s.len) }.clone()
+// qstr_slice returns a BORROWED view of a string query parameter (no .clone()). Valid
+// only while req.buffer is alive — fine for Bind params, which write_bind copies
+// synchronously inside park→async_submit before the request buffer is recycled.
+@[direct_array_access]
+fn qstr_slice(req request_parser.HttpRequest, key []u8) []u8 {
+	s := req.get_query_slice(key) or { return []u8{} }
+	return unsafe { req.buffer[s.start..s.start + s.len] }
+}
+
+// parse_i64_slice parses a decimal i64 from buf[start..start+length] in place (leading
+// '-' allowed; stops at the first non-digit), allocating nothing.
+@[direct_array_access]
+fn parse_i64_slice(buf []u8, start int, length int) i64 {
+	mut n := i64(0)
+	mut neg := false
+	for i in 0 .. length {
+		c := buf[start + i]
+		if i == 0 && c == `-` {
+			neg = true
+			continue
+		}
+		if c < `0` || c > `9` {
+			break
+		}
+		n = n * 10 + i64(c - `0`)
+	}
+	return if neg { -n } else { n }
 }
 
 @[direct_array_access]
@@ -950,9 +1093,13 @@ fn main() {
 				panic('vanilla-epoll: pg pool bring-up failed: ${err}')
 			}
 			w := &WorkerCtx{
-				ro:      ro
-				pool:    pool
-				scratch: []u8{cap: 32 * 1024} // reused render buffer (see WorkerCtx.scratch)
+				ro:            ro
+				pool:          pool
+				scratch:       []u8{cap: 32 * 1024} // reused render buffer (see WorkerCtx.scratch)
+				param_scratch: []u8{cap: 256}       // reused int-param decimal bytes (≫ 5×20 worst case)
+				params_buf:    []?[]u8{cap: 8}      // reused Bind params array
+				stash_pool:    []&Stash{cap: 64}    // Stash free-list
+				fortunes_buf:  []Fortune{cap: 256}  // reused /fortunes rows
 			}
 			return voidptr(w)
 		}
