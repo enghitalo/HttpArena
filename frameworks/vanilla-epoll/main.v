@@ -142,11 +142,12 @@ fn wi(mut out []u8, n i64) {
 		unsafe { out.push_many(&tmp[0], 1) }
 		return
 	}
-	mut x := n
-	mut neg := false
-	if x < 0 {
-		neg = true
-		x = -x
+	neg := n < 0
+	// Build the magnitude in u64: i64::MIN's i64 negation overflows (the value
+	// isn't representable as i64), so derive it as -(n+1)+1 with the +1 in u64.
+	mut x := u64(n)
+	if neg {
+		x = u64(-(n + 1)) + 1
 	}
 	mut i := 20
 	for x > 0 {
