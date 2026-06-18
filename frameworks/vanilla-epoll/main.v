@@ -208,6 +208,16 @@ fn write_resp(mut out []u8, ctype string, body string) {
 	ws(mut out, body)
 }
 
+// emit_int writes a 200 whose body is a single integer, formatting it into the
+// reused per-worker scratch. The obvious `write_resp(.., n.str())` heap-allocates
+// an int->string on every request — a permanent leak under `-gc none` (e.g. the
+// /baseline11 path was ~6 GiB at 3.4M RPS purely from sum.str()).
+fn (mut w WorkerCtx) emit_int(mut out []u8, ctype string, n i64) {
+	unsafe { w.scratch.len = 0 }
+	wi(mut w.scratch, n)
+	emit(mut out, ctype, w.scratch)
+}
+
 // Precomputed full response for the fixed /pipeline plaintext "ok" (the highest-
 // RPS test): one bulk copy on the hot path, no query scan / route slice / build.
 const pipeline_resp = 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
@@ -275,12 +285,12 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		if method == 'POST' {
 			sum += body_int(req)
 		}
-		write_resp(mut out, 'text/plain', sum.str())
+		w.emit_int(mut out, 'text/plain', sum)
 		return .done
 	} else if route == '/upload' {
 		cl := req.content_length()
 		n := if cl >= 0 { i64(cl) } else { i64(req.body.len) }
-		write_resp(mut out, 'text/plain', n.str())
+		w.emit_int(mut out, 'text/plain', n)
 		return .done
 	} else if route.starts_with('/json/') {
 		count := clamp_count(parse_u_at(route, 6), w.ro.dataset.len)
