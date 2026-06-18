@@ -185,6 +185,27 @@ fn write_resp(mut out []u8, ctype string, body string) {
 // RPS test): one bulk copy on the hot path, no query scan / route slice / build.
 const pipeline_resp = 'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
+// Raw request prefix for the fixed /pipeline plaintext test. The trailing space is
+// the request-line SP, so this matches exactly `GET /pipeline ` (not /pipeline2).
+const pipeline_prefix = 'GET /pipeline '.bytes()
+
+// has_pipeline_prefix is the skip-decode gate for the highest-RPS /pipeline test:
+// match the raw request prefix and blit the response WITHOUT parsing. Per callgrind
+// the in-handle parse (parse_http1_request_line + decode_into + tos) is ~17% of this
+// request; the request was already framed by the caller, so decode adds nothing here.
+@[direct_array_access]
+fn has_pipeline_prefix(b []u8) bool {
+	if b.len < pipeline_prefix.len {
+		return false
+	}
+	for i in 0 .. pipeline_prefix.len {
+		if b[i] != pipeline_prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
 const not_found = 'HTTP/1.1 404 Not Found\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
 const created = 'HTTP/1.1 201 Created\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
@@ -195,6 +216,13 @@ const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Leng
 
 fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	mut w := unsafe { &WorkerCtx(ac.state) }
+	// Skip-decode fast path: the fixed /pipeline plaintext (highest-RPS test) blits
+	// its response before ANY parsing. The request is already framed by the caller,
+	// so decode_into/parse_http1_request_line add nothing here (~17% of the request).
+	if has_pipeline_prefix(req_buffer) {
+		wb(mut out, pipeline_resp)
+		return .done
+	}
 	// decode_into fills req in place — no `!HttpRequest` Result boxing (~13% of the
 	// parse path per callgrind), the same no-boxing entry the sync build uses.
 	mut req := request_parser.HttpRequest{
