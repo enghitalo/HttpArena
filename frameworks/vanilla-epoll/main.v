@@ -249,6 +249,14 @@ const created = 'HTTP/1.1 201 Created\r\nServer: vanilla\r\nContent-Length: 0\r\
 
 const bad_request = 'HTTP/1.1 400 Bad Request\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
+// Returned when the async DB pool sheds a request under saturation (every pooled
+// connection at max_inflight). It is the SHED fallback for the crud write/get
+// paths — distinct from a genuine 400 (malformed body) or 404 (missing item): the
+// request was well-formed, the server was momentarily out of DB pipeline capacity,
+// so 503 is the honest status. (Read paths still shed to an empty 200 — revisiting
+// that whole backpressure policy is tracked upstream in vanilla.)
+const service_unavailable = 'HTTP/1.1 503 Service Unavailable\r\nServer: vanilla\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
 // ── async handler ────────────────────────────────────────────────────────────
 
 fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
@@ -682,7 +690,7 @@ fn (mut w WorkerCtx) start_crud_get(mut out []u8, mut ac core.AsyncCtx, id int) 
 	w.push_int(i64(id))
 	return w.park(mut out, mut ac,
 		'SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE id = \$1',
-		w.params_buf, k_crud_get, id, 0, not_found)
+		w.params_buf, k_crud_get, id, 0, service_unavailable)
 }
 
 fn (mut w WorkerCtx) render_crud_get(mut out []u8, res pg_async.Result, id int) {
@@ -717,7 +725,7 @@ fn (mut w WorkerCtx) start_crud_create(mut out []u8, mut ac core.AsyncCtx, req r
 	w.push_int(i64(c.quantity))
 	return w.park(mut out, mut ac,
 		"INSERT INTO items (id, name, category, price, quantity, active, tags, rating_score, rating_count) VALUES (\$1, \$2, \$3, \$4, \$5, true, '[]', 0, 0) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category, price = EXCLUDED.price, quantity = EXCLUDED.quantity",
-		w.params_buf, k_crud_create, 0, 0, bad_request)
+		w.params_buf, k_crud_create, 0, 0, service_unavailable)
 }
 
 fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id int, req request_parser.HttpRequest) core.AsyncStep {
@@ -734,7 +742,7 @@ fn (mut w WorkerCtx) start_crud_update(mut out []u8, mut ac core.AsyncCtx, id in
 	w.push_int(i64(c.quantity))
 	return w.park(mut out, mut ac,
 		'UPDATE items SET name = \$2, category = \$3, price = \$4, quantity = \$5 WHERE id = \$1',
-		w.params_buf, k_crud_update, id, 0, bad_request)
+		w.params_buf, k_crud_update, id, 0, service_unavailable)
 }
 
 fn (mut w WorkerCtx) render_crud_update(mut out []u8, id int) {
