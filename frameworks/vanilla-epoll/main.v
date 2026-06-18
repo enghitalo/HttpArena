@@ -329,7 +329,10 @@ fn (mut w WorkerCtx) park(mut out []u8, mut ac core.AsyncCtx, query_text string,
 	// One watch per parked request on the connection's fd. When several requests
 	// share a connection the reactor auto-promotes the fd to a FIFO queue and fans
 	// each reply out in submission order (queue[k] ↔ the connection's inflight[k]).
-	ac.watch(w.pool.fd(idx), .readable, on_db_ready, voidptr(st))
+	// watch_persistent: the fd is a POOLED connection — if this client disconnects
+	// mid-query the runtime must drain the orphaned reply and keep the connection
+	// open for reuse, never close it (a close would force a reconnect + re-auth).
+	ac.watch_persistent(w.pool.fd(idx), .readable, on_db_ready, voidptr(st))
 	return .suspend
 }
 
@@ -348,7 +351,10 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		return .done
 	}
 	if !poll.ready {
-		ac.watch(w.pool.fd(st.conn_idx), .readable, on_db_ready, ac.udata) // more bytes to come
+		// Re-arm persistent: the single-watch path clears the slot before running this
+		// continuation, so the re-arm is a fresh entry — watch_persistent re-stamps the
+		// pool-owned flag that a plain watch would drop. (more bytes to come)
+		ac.watch_persistent(w.pool.fd(st.conn_idx), .readable, on_db_ready, ac.udata)
 		return .suspend
 	}
 	res := poll.result
