@@ -102,6 +102,11 @@ mut:
 	// Reused /fortunes row buffer: messages are BORROWED views into the Result frames
 	// (stable during the synchronous render), not bytestr().clone()'d.
 	fortunes_buf []Fortune
+	// Reused dechunk scratch: a chunked POST body is reassembled here (len reset
+	// per use, grows to high-water) instead of allocating a strings.Builder +
+	// .str() per request — under -gc none that was the /baseline11 chunked-POST
+	// leak (~6 GiB at 3.8M req/s in the arena baseline mix).
+	dechunk_buf []u8
 }
 
 // Stash is the per-request state that must survive across the park (the request
@@ -291,7 +296,7 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	if route == '/baseline11' {
 		mut sum := qint(req, qk_a) + qint(req, qk_b)
 		if method == 'POST' {
-			sum += body_int(req)
+			sum += w.body_int(req)
 		}
 		w.emit_int(mut out, 'text/plain', sum)
 		return .done
@@ -940,51 +945,86 @@ fn clamp_count(n i64, max int) int {
 	return int(n)
 }
 
-fn body_int(req request_parser.HttpRequest) i64 {
+fn (mut w WorkerCtx) body_int(req request_parser.HttpRequest) i64 {
 	if req.body.len == 0 {
 		return 0
 	}
-	raw := unsafe { tos(&req.buffer[req.body.start], req.body.len) }
 	if te := req.get_header_value_slice('Transfer-Encoding') {
 		val := unsafe { tos(&req.buffer[te.start], te.len) }
 		if val.contains('chunked') {
-			return dechunk(raw).i64()
+			// Reassemble the chunked body into the reused per-worker scratch (no
+			// per-request strings.Builder/.str() alloc — the -gc none leak), then
+			// parse the integer from the bytes in place.
+			unsafe { w.dechunk_buf.len = 0 }
+			dechunk_into(mut w.dechunk_buf, req.buffer, req.body.start, req.body.len)
+			return parse_i64_slice(w.dechunk_buf, 0, w.dechunk_buf.len)
 		}
 	}
-	return raw.i64()
+	return parse_i64_slice(req.buffer, req.body.start, req.body.len)
 }
 
-fn dechunk(s string) string {
-	mut out := strings.new_builder(s.len)
-	mut i := 0
-	for i < s.len {
-		nl := s.index_after('\r\n', i) or { break }
-		size := strconv_hex(s[i..nl])
+// dechunk_into appends the dechunked body bytes from the chunked-encoded region
+// buf[start..start+length] into `out` (a reused scratch). Same framing as the old
+// string-building dechunk — read each hex chunk-size line terminated by CRLF, copy
+// `size` data bytes, stop at the 0-size chunk or any malformation — but it appends
+// raw bytes and parses the size from bytes, so it allocates nothing per request.
+@[direct_array_access]
+fn dechunk_into(mut out []u8, buf []u8, start int, length int) {
+	end := start + length
+	mut i := start
+	for i < end {
+		// find the CRLF terminating the chunk-size line
+		mut nl := -1
+		for j := i; j + 1 < end; j++ {
+			if buf[j] == `\r` && buf[j + 1] == `\n` {
+				nl = j
+				break
+			}
+		}
+		if nl < 0 {
+			break
+		}
+		size := parse_hex_slice(buf, i, nl - i)
 		if size <= 0 {
 			break
 		}
 		data_start := nl + 2
-		out.write_string(s[data_start..data_start + size])
-		i = data_start + size + 2
+		// Overflow-safe bound: `data_start + size` is computed in i32 and would WRAP
+		// negative for an attacker-chosen size near 0x7fffffff, slipping past a naive
+		// `data_start + size > end` check and feeding a ~2 GiB out-of-bounds read into
+		// push_many. `end - data_start` is a small non-negative int (data_start <= end),
+		// so comparing the other way never overflows.
+		if size > end - data_start {
+			break
+		}
+		unsafe { out.push_many(&buf[data_start], size) }
+		i = data_start + size + 2 // past the data + its trailing CRLF
 	}
-	return out.str()
 }
 
-fn strconv_hex(s string) int {
-	mut n := 0
-	for c in s.trim_space() {
+// parse_hex_slice reads a hex integer from buf[start..start+length], stopping at
+// the first non-hex byte (a chunk-extension `;` or the CRLF). No allocation.
+@[direct_array_access]
+fn parse_hex_slice(buf []u8, start int, length int) int {
+	mut n := i64(0)
+	for k in start .. start + length {
+		c := buf[k]
 		d := if c >= `0` && c <= `9` {
-			int(c - `0`)
+			i64(c - `0`)
 		} else if c >= `a` && c <= `f` {
-			int(c - `a` + 10)
+			i64(c - `a` + 10)
 		} else if c >= `A` && c <= `F` {
-			int(c - `A` + 10)
+			i64(c - `A` + 10)
 		} else {
 			break
 		}
 		n = n * 16 + d
+		if n > 0x7fff_ffff {
+			return 0x7fff_ffff // saturate: i64 accumulation can't wrap negative, and the
+			// caller's `size > end - data_start` guard then rejects this oversized chunk
+		}
 	}
-	return n
+	return int(n)
 }
 
 fn accepts_gzip(req request_parser.HttpRequest) bool {
@@ -1119,6 +1159,7 @@ fn main() {
 				params_buf:    []?[]u8{cap: 8}      // reused Bind params array
 				stash_pool:    []&Stash{cap: 64}    // Stash free-list
 				fortunes_buf:  []Fortune{cap: 256}  // reused /fortunes rows
+				dechunk_buf:   []u8{cap: 4096}      // reused chunked-body scratch
 			}
 			return voidptr(w)
 		}
