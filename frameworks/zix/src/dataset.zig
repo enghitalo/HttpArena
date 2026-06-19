@@ -1,3 +1,11 @@
+//! HttpArena: zix
+//!
+//! Dataset loader for the /json endpoint.
+//!
+//! Loads the fixed 50-item benchmark dataset once at startup and pre-renders
+//! each item as a JSON object fragment (without the closing brace), so the hot
+//! path only appends the per-request total and the closing brace.
+
 const std = @import("std");
 
 pub const ItemCount = 50;
