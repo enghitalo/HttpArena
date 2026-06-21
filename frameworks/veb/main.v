@@ -195,7 +195,11 @@ fn main() {
 	if size > 200 {
 		size = 200
 	}
-	mut db := pg.connect(parse_db_url(url), pg.PoolConfig{ max_open_conns: size })!
+	// max_idle_conns MUST equal max_open_conns: db.pg defaults idle to 2, so any conn
+	// released beyond the 2nd is physically closed and the next acquire pays a full PG
+	// connect handshake — connection churn on every concurrent DB request. Keeping
+	// idle == open makes it a fixed warm pool.
+	mut db := pg.connect(parse_db_url(url), pg.PoolConfig{ max_open_conns: size, max_idle_conns: size })!
 
 	dataset_path := os.getenv_opt('DATASET_PATH') or { '/data/dataset.json' }
 	dataset := json.decode([]DatasetItem, os.read_file(dataset_path) or { '[]' }) or {
