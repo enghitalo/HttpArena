@@ -682,7 +682,12 @@ fn main() {
 	if size > 200 {
 		size = 200 // leave headroom under Postgres max_connections
 	}
-	mut db := pg.connect(parse_db_url(url), pg.PoolConfig{ max_open_conns: size })!
+	// max_idle_conns MUST equal max_open_conns: db.pg defaults idle to 2, so any conn
+	// released beyond the 2nd is physically closed (pool.v) and the next acquire pays a
+	// full PG connect handshake. Under the arena's concurrent DB load that churns
+	// connections on every request (async-db/crud/fortunes were down 60-90%). Keeping
+	// idle == open makes it a fixed warm pool, matching the old ConnectionPool.
+	mut db := pg.connect(parse_db_url(url), pg.PoolConfig{ max_open_conns: size, max_idle_conns: size })!
 
 	dataset_path := os.getenv_opt('DATASET_PATH') or { '/data/dataset.json' }
 	dataset_raw := os.read_file(dataset_path) or { '[]' }
