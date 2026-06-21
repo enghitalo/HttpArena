@@ -18,8 +18,8 @@ the [V](https://vlang.io) standard library.
 ## Stack
 
 * [V](https://vlang.io) — pinned master commit `c0624b274` (built from source)
-* [veb](https://modules.vlang.io/veb.html) — HTTP framework, built with `-prealloc`
-  (per-request memory arena, freed after each request, no GC)
+* [veb](https://modules.vlang.io/veb.html) — HTTP framework, built with the default
+  GC (Boehm; `-prealloc` is a never-free arena unsuited to a server)
 * `db.pg` (stdlib) — pooled Go-style PostgreSQL driver (`db.exec_param_many`)
 
 JSON is serialized manually (precomputed prefixes + `strings.Builder`) to avoid

@@ -7,8 +7,7 @@ RUN apt-get -qq update && \
 
 # Pinned, reproducible V at master commit c0624b274 (built from source). No release
 # tag carries the modern stdlib this framework needs: the pooled Go-style `db.pg`
-# (vlang/v#27265) and veb's `-prealloc` request-arena (frees per request, no GC,
-# vlang/v 45545c2). `make` bootstraps via the matching vc; if a much later rebuild
+# (vlang/v#27265). `make` bootstraps via the matching vc; if a much later rebuild
 # ever fails to bootstrap, pin vlang/vc to the commit cut for this V.
 RUN git clone https://github.com/vlang/v /opt/v && \
     cd /opt/v && git checkout c0624b274 && \
@@ -16,9 +15,11 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 
 WORKDIR /app
 COPY . .
-# -prealloc (NOT -gc none): veb resets a per-request memory arena, so memory is
-# reclaimed after each request with no garbage collector.
-RUN v -prod -prealloc . -o server
+# Default GC (Boehm) — NOT -prealloc, NOT -gc none. V's -prealloc is a never-free bump
+# arena: fine for short-lived programs (the compiler), but a long-running server grows
+# unbounded under load (30GiB+ in the arena benchmark). -gc none would leak every
+# per-request allocation. Boehm keeps memory bounded; c0624b2's codegen wins still apply.
+RUN v -prod . -o server
 
 FROM debian:stable-slim
 RUN apt-get -qq update && \
