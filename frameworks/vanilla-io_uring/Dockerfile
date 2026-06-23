@@ -5,14 +5,14 @@ RUN apt-get -qq update && \
         ca-certificates build-essential git libpq-dev liburing-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Pinned, reproducible V at master commit c0624b274 (built from source). Master is
+# Pinned, reproducible V at master commit 6c4d26f1f (built from source). Master is
 # now preferred over the 0.5.1 tag: the codegen regression that forced 0.5.1 (single-
 # element array push 4-7x slower, vlang/v#27468) is fixed (vlang/v#27470), and the
 # code uses the modern pooled Go-style db.pg (vlang/v#27265). For a current master
 # commit, `make` bootstraps via the matching vc; if a much later rebuild ever fails
 # to bootstrap, pin vlang/vc to the commit cut for this V.
 RUN git clone https://github.com/vlang/v /opt/v && \
-    cd /opt/v && git checkout c0624b274 && \
+    cd /opt/v && git checkout 6c4d26f1f && \
     make && ln -s /opt/v/v /usr/local/bin/v
 
 # Install the vanilla HTTP server as the `vanilla` module (import vanilla.http_server),
