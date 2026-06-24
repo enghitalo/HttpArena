@@ -719,6 +719,26 @@
     "status_5xx": 0
   },
   {
+    "framework": "mq-bridge-py",
+    "language": "Python",
+    "rps": 1112,
+    "avg_latency": "28.75ms",
+    "p99_latency": "89.50ms",
+    "cpu": "3398.3%",
+    "memory": "21.6GiB",
+    "connections": 32,
+    "threads": 64,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "211.93KB/s",
+    "input_bw": "8.82GB/s",
+    "reconnects": 1107,
+    "status_2xx": 5560,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  },
+  {
     "framework": "phoenix-bandit",
     "language": "Elixir",
     "rps": 704,
