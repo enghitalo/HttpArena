@@ -21,7 +21,7 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 # main moved, but that hit api.github.com every build and a transient 504/rate-limit
 # failed the whole build (MDA2AV/HttpArena#895). Bump this commit to pick up lib fixes.
 RUN git clone https://github.com/enghitalo/vanilla /root/.vmodules/vanilla && \
-    git -C /root/.vmodules/vanilla checkout a7f22dab29f012b44d36b1e1cae6bda82166ad30
+    git -C /root/.vmodules/vanilla checkout 1822cbb4b5316f433df4805bb68560fadd4df385
 
 WORKDIR /app
 COPY . .
