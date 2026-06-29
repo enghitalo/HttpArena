@@ -23,12 +23,16 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 # (or rate-limit) failed the whole build (MDA2AV/HttpArena#895). To pick up upstream
 # library fixes, bump this commit.
 #
-# vanilla main @15bd57e picks up the allocation fixes from a lib-wide audit:
-# enghitalo/vanilla#72 (pg_async: read wire ints at offset, drop per-read slices),
-# #73 (static_assets: zero-copy conditional-GET/Range parsing) and #74 (TLS: pool the
-# per-connection read/response buffers).
+# Pinned to the kTLS branch (perf/ktls-record-offload @7ca36f6) — 15bd57e (the
+# lib-wide alloc audit: #72 pg_async, #73 static_assets, #74 TLS buffer pooling)
+# PLUS kTLS record offload for json-tls: after the Mbed TLS handshake the kernel
+# does TLS 1.3 record AES-128-GCM (setsockopt TLS_TX+TLS_RX), so the epoll worker's
+# steady-state read/write are plain recv/send — no per-record userspace crypto and
+# no PSA key-store mutex on the hot path. Falls back to userspace TLS where the
+# `tls` kernel module is absent. (The 5 TLS files are identical at 15bd57e, so this
+# is 15bd57e + kTLS only.)
 RUN git clone https://github.com/enghitalo/vanilla /root/.vmodules/vanilla && \
-    git -C /root/.vmodules/vanilla checkout 15bd57e5ae8cf1383bd386826e48e08a10f6d4b4
+    git -C /root/.vmodules/vanilla checkout 7ca36f606b1488a847f2e8564c63eba0c4beb058
 
 # Mbed TLS 4 for the json-tls profile. The vanilla `tls` module's C shim
 # (vanilla_tls.c, built with `-d vanilla_tls`) targets the Mbed TLS 4.x API
