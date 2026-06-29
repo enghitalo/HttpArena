@@ -24,8 +24,8 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 # main moved, but that hit api.github.com every build and a transient 504/rate-limit
 # failed the whole build (MDA2AV/HttpArena#895). Bump this commit to pick up lib fixes.
 #
-# vanilla bumped to main + the static_assets static path (enghitalo/vanilla#80
-# url_prefix mount, #81 core.queue_buf borrowed send for small assets): this entry
+# vanilla main @b189036 (incl. enghitalo/vanilla#80 url_prefix mount + #81
+# core.queue_buf borrowed send for small assets): this entry
 # now serves /static/* through the audited static_assets module — precompressed
 # .br/.gz negotiation per Accept-Encoding + ETag/Vary, with small assets emitted via
 # core.queue_buf borrowed send (the #75 mechanism, now folded into the module) so the
@@ -33,7 +33,7 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 # buffer. Replaces the hand-rolled identity-only map. Also includes #79 (kTLS, inert
 # here: built without -d vanilla_tls).
 RUN git clone https://github.com/enghitalo/vanilla /root/.vmodules/vanilla && \
-    git -C /root/.vmodules/vanilla checkout 4e2267058395222b080801a1f89191fbfa9395c3
+    git -C /root/.vmodules/vanilla checkout b189036212e4283ef2cffe42b318b556f8a3d1bc
 
 WORKDIR /app
 COPY . .
