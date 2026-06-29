@@ -3,6 +3,7 @@ module main
 import vanilla.http_server
 import vanilla.http_server.http1_1.request_parser
 import vanilla.http_server.core
+import vanilla.http_server.static_assets
 import vanilla.pg_async
 import json
 import os
@@ -28,16 +29,6 @@ struct DatasetItem {
 	rating   Rating
 }
 
-// A static asset served with sendfile(2): the response head is precomputed, the
-// body is streamed zero-copy straight from the page-cached file fd.
-struct StaticFile {
-	header []u8
-	fd     int
-	size   i64
-}
-
-fn C.open(pathname &char, flags int) int
-
 struct CrudCreate {
 	id       int
 	name     string
@@ -57,7 +48,7 @@ struct Fortune {
 struct SharedRO {
 	dataset  []DatasetItem
 	prefixes []string
-	assets   map[string]StaticFile
+	asv      static_assets.AssetServer // canonical static server (negotiation + sendfile), mounted at /static/
 mut:
 	// PROCESS-SHARED caches (mutex-guarded). They must be shared, not per-worker:
 	// validate.sh does two GET /crud/items/42 and requires X-Cache MISS then HIT,
@@ -354,17 +345,14 @@ fn handle(req_buffer []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	} else if route == '/fortunes' {
 		return w.start_fortunes(mut out, mut ac)
 	} else if route.starts_with('/static/') {
-		// Zero-copy lookup key: a view into the request buffer. The map only hashes the
-		// key bytes and never retains it, so the view is safe. `route[8..]` would be a
-		// substr -> a fresh heap string every request, which `-gc none` never frees
-		// (+625 MiB over 20M requests, proven in isolation). Mirrors the vanilla lib's
-		// own static_assets module (http_server/static_assets/static_assets.v).
-		if f := w.ro.assets[unsafe { tos(route.str + 8, route.len - 8) }] {
-			wb(mut out, f.header)
-			core.queue_file(f.fd, 0, f.size)
-		} else {
-			wb(mut out, not_found)
-		}
+		// Canonical static serving via the lib's static_assets module: negotiates the
+		// precompressed .br/.gz sibling per Accept-Encoding (the arena sends
+		// `br;q=1, gzip;q=0.8`, so this ships the ~4x smaller .br body instead of the
+		// raw file), plus ETag/Vary/Cache-Control and sendfile(2) for large assets —
+		// ONE audited implementation instead of a second hand-rolled identity-only
+		// path that ignored Accept-Encoding. Mounted at /static/; emits via the same
+		// core.queue_file sendfile handoff the worker already drains.
+		w.ro.asv.respond_into(req_buffer, mut out) or { wb(mut out, not_found) }
 		return .done
 	} else if route == '/crud/items' {
 		if method == 'POST' {
@@ -1235,30 +1223,6 @@ fn parse_crud_body_fast(body []u8, need_id bool) ?CrudFastBody {
 	}
 }
 
-fn content_type(name string) string {
-	ext := name.all_after_last('.')
-	return match ext {
-		'css' { 'text/css' }
-		'js' { 'application/javascript' }
-		'json' { 'application/json' }
-		'html' { 'text/html' }
-		'svg' { 'image/svg+xml' }
-		'webp' { 'image/webp' }
-		'woff2' { 'font/woff2' }
-		else { 'application/octet-stream' }
-	}
-}
-
-fn static_header(ctype string, size i64) []u8 {
-	mut sb := strings.new_builder(96)
-	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
-	sb.write_string(ctype)
-	sb.write_string('\r\nContent-Length: ')
-	sb.write_decimal(size)
-	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	return sb
-}
-
 // parse_db_url turns postgres://user:pass@host:port/dbname into a pg_async.ConnConfig.
 fn parse_db_url(u string) pg_async.ConnConfig {
 	mut s := u
@@ -1314,29 +1278,22 @@ fn main() {
 		prefixes << enc#[..-1] + ',"total":'
 	}
 
-	mut assets := map[string]StaticFile{}
 	static_dir := os.getenv_opt('STATIC_DIR') or { '/data/static' }
-	for name in os.ls(static_dir) or { []string{} } {
-		if name.ends_with('.gz') || name.ends_with('.br') {
-			continue
-		}
-		path := '${static_dir}/${name}'
-		fsize := i64(os.file_size(path))
-		fd := C.open(&char(path.str), 0)
-		if fd < 0 {
-			continue
-		}
-		assets[name] = StaticFile{
-			header: static_header(content_type(name), fsize)
-			fd:     fd
-			size:   fsize
-		}
-	}
+	// Canonical static server: loads every asset PLUS its .br/.gz siblings once,
+	// mounts them at /static/, and negotiates Accept-Encoding per request (serving
+	// the precompressed body when accepted). Replaces the former hand-rolled,
+	// identity-only map that ignored Accept-Encoding and always shipped the raw
+	// file. spa_fallback is off: the arena fixture set has no SPA entrypoint.
+	asv := static_assets.new(static_assets.Config{
+		root:         static_dir
+		url_prefix:   '/static/'
+		spa_fallback: ''
+	}) or { panic('vanilla-epoll: static_assets init failed: ${err}') }
 
 	ro := &SharedRO{
 		dataset:  dataset
 		prefixes: prefixes
-		assets:   assets
+		asv:      asv
 		crud:     []CrudSlot{len: crud_cache_slots}
 		crud_mu:  sync.new_rwmutex()
 		gz:       map[u64][]u8{}
