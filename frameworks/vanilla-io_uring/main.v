@@ -2,6 +2,7 @@ module main
 
 import vanilla.http_server
 import vanilla.http_server.http1_1.request_parser
+import vanilla.http_server.tls
 import db.pg
 import json
 import os
@@ -704,6 +705,29 @@ fn parse_db_url(u string) pg.Config {
 	}
 }
 
+// load_tls_config builds the json-tls server's TLS config. It reads the cert/key
+// the HttpArena harness bind-mounts at /certs (overridable via TLS_CERT/TLS_KEY).
+// If NO cert is mounted (local dev), it falls back to a fresh self-signed cert —
+// the benchmark/validate clients use `curl -k` / wrk, which never verify it. If a
+// cert IS present but the key is missing/unreadable, it FAILS LOUDLY rather than
+// silently self-signing. TLS 1.3 + ALPN http/1.1 are fixed by the tls shim.
+fn load_tls_config() &tls.Config {
+	cert_path := os.getenv_opt('TLS_CERT') or { '/certs/server.crt' }
+	key_path := os.getenv_opt('TLS_KEY') or { '/certs/server.key' }
+	cert := os.read_bytes(cert_path) or {
+		eprintln('vanilla-io_uring: no TLS cert at ${cert_path} (${err}); using ephemeral self-signed')
+		return tls.new_self_signed() or {
+			panic('vanilla-io_uring: self-signed TLS bring-up failed: ${err}')
+		}
+	}
+	key := os.read_bytes(key_path) or {
+		panic('vanilla-io_uring: TLS cert present at ${cert_path} but key unreadable at ${key_path}: ${err}')
+	}
+	return tls.new_from_pem(cert, key) or {
+		panic('vanilla-io_uring: TLS cert/key parse failed: ${err}')
+	}
+}
+
 fn main() {
 	url := os.getenv_opt('DATABASE_URL') or { 'postgres://bench:bench@localhost:5432/benchmark' }
 	mut size := (os.getenv_opt('DATABASE_MAX_CONN') or { '64' }).int()
@@ -757,6 +781,59 @@ fn main() {
 		gz_cache: map[u64][]u8{}
 		gz_mu:    sync.new_rwmutex()
 	}
+
+	// ── json-tls profile: /json over HTTPS on :8081 via the epoll + kTLS backend ──
+	// The lib's io_uring backend has no TLS, so the json-tls listener runs on the
+	// epoll backend (TLS 1.3 via Mbed TLS; after the handshake the kernel does record
+	// AES-128-GCM via kTLS where the `tls` module is present, else userspace fallback).
+	// It serves ONLY /json (404 elsewhere) — minimal TLS surface — reusing the same
+	// allocation-free write_json_response (read-only: dataset + prefixes). A STATELESS
+	// request_handler captures `sh`; it never touches the DB/caches, so it runs safely
+	// alongside the io_uring workers. The io_uring server below keeps the non-TLS
+	// profiles on :8080.
+	tls_handler := fn [sh] (req_buffer []u8, fd int, mut out []u8) ! {
+		mut req := request_parser.HttpRequest{
+			buffer: req_buffer
+		}
+		if !request_parser.decode_into(mut req) {
+			wb(mut out, bad_request)
+			return
+		}
+		target := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
+		qpos := target.index_u8(`?`)
+		route := if qpos < 0 { target } else { unsafe { tos(target.str, qpos) } }
+		if route.starts_with('/json/') {
+			count := clamp_count(parse_u_at(route, 6), sh.dataset.len)
+			mut m := qint(req, qk_m)
+			if m == 0 {
+				m = 1
+			}
+			sh.write_json_response(mut out, count, m)
+			return
+		}
+		wb(mut out, not_found)
+	}
+	// Port is fixed to 8081 by the HttpArena harness; TLS_PORT lets local runs pick a
+	// free port. run() blocks, so the TLS server runs on its own thread (value-mut
+	// receiver → spawn via a closure with a local mut copy; the two servers are
+	// independent — own socket, workers and backend).
+	mut tls_port := (os.getenv_opt('TLS_PORT') or { '8081' }).int()
+	if tls_port <= 0 {
+		tls_port = 8081
+	}
+	tls_server := http_server.new_server(http_server.ServerConfig{
+		port:            tls_port
+		io_multiplexing: .epoll
+		limits:          http_server.Limits{
+			max_request_bytes: 64 * 1024
+		}
+		request_handler: tls_handler
+		tls_config:      load_tls_config()
+	})!
+	spawn fn [tls_server] () {
+		mut s := tls_server
+		s.run()
+	}()
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8080
