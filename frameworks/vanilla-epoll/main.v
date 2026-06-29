@@ -1288,6 +1288,15 @@ fn main() {
 		root:         static_dir
 		url_prefix:   '/static/'
 		spa_fallback: ''
+		// Serve any representation >= 16 KiB from disk with sendfile(2) instead of
+		// preloading + copying it through the per-connection write buffer. The arena
+		// .br siblings are small (<256 KiB, the default threshold), so the default
+		// would copy each ~33-47 KiB .br into every connection's write_buf, which the
+		// pool then retains — a per-connection RSS balloon at high conn counts (CI
+		// measured +168% mem, ~1 GiB at 6800 conns). 16 KiB sendfiles the large .br
+		// (the balloon drivers) zero-copy while still preloading the tiny ones (cheap
+		// memcpy, negligible write_buf growth) — flat RSS + best throughput in A/B.
+		sendfile_min_bytes: 16 * 1024
 	}) or { panic('vanilla-epoll: static_assets init failed: ${err}') }
 
 	ro := &SharedRO{
