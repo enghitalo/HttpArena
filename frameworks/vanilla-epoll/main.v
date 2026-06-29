@@ -3,6 +3,7 @@ module main
 import vanilla.http_server
 import vanilla.http_server.http1_1.request_parser
 import vanilla.http_server.core
+import vanilla.http_server.tls
 import vanilla.pg_async
 import json
 import os
@@ -848,28 +849,38 @@ fn (mut w WorkerCtx) render_crud_update(mut out []u8, id int) {
 
 // ── /json (non-DB) ───────────────────────────────────────────────────────────
 
-fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
+// write_json_into is the transport-agnostic /json serializer: it only APPENDS
+// response bytes to `out`, so the plaintext path (via WorkerCtx) and the json-tls
+// path (a stateless TLS handler) share it verbatim. `ro` is read-only and nothing
+// per-request is heap-allocated. Content-Length is precomputed from the SAME
+// values the body emits, so the framed length can never desync from the body
+// (no response-splitting / smuggling surface).
+fn write_json_into(ro &SharedRO, mut out []u8, count int, m i64) {
 	// 21 = len('{"items":[') + len('],"count":') + '}'; plus the count's own digits
 	mut clen := 21 + digits(i64(count))
 	if count > 0 {
 		clen += count - 1
 	}
 	for i in 0 .. count {
-		t := w.ro.dataset[i].price * w.ro.dataset[i].quantity * m
-		clen += w.ro.prefixes[i].len + digits(t) + 1
+		t := ro.dataset[i].price * ro.dataset[i].quantity * m
+		clen += ro.prefixes[i].len + digits(t) + 1
 	}
 	ws(mut out,
 		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, i64(clen))
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"items":[')
 	for i in 0 .. count {
-		ws(mut out, w.ro.prefixes[i])
-		wi(mut out, w.ro.dataset[i].price * w.ro.dataset[i].quantity * m)
+		ws(mut out, ro.prefixes[i])
+		wi(mut out, ro.dataset[i].price * ro.dataset[i].quantity * m)
 		ws(mut out, if i < count - 1 { '},' } else { '}' })
 	}
 	ws(mut out, '],"count":')
 	wi(mut out, i64(count))
 	ws(mut out, '}')
+}
+
+fn (w &WorkerCtx) write_json_response(mut out []u8, count int, m i64) {
+	write_json_into(w.ro, mut out, count, m)
 }
 
 fn (mut w WorkerCtx) write_json_gzip(mut out []u8, count int, m i64) {
@@ -1281,6 +1292,30 @@ fn parse_db_url(u string) pg_async.ConnConfig {
 	}
 }
 
+// load_tls_config builds the json-tls server's TLS config. It reads the cert/key
+// the HttpArena harness bind-mounts at /certs (overridable via TLS_CERT/TLS_KEY).
+// If NO cert is mounted (local dev), it falls back to a fresh self-signed cert —
+// the benchmark/validate clients use `curl -k` / wrk, which never verify it. If a
+// cert IS present but the key is missing/unreadable, it FAILS LOUDLY rather than
+// silently self-signing, so a real misconfiguration can't slip through as "works
+// but with the wrong identity". TLS 1.3 + ALPN http/1.1 are fixed by the tls shim.
+fn load_tls_config() &tls.Config {
+	cert_path := os.getenv_opt('TLS_CERT') or { '/certs/server.crt' }
+	key_path := os.getenv_opt('TLS_KEY') or { '/certs/server.key' }
+	cert := os.read_bytes(cert_path) or {
+		eprintln('vanilla-epoll: no TLS cert at ${cert_path} (${err}); using ephemeral self-signed')
+		return tls.new_self_signed() or {
+			panic('vanilla-epoll: self-signed TLS bring-up failed: ${err}')
+		}
+	}
+	key := os.read_bytes(key_path) or {
+		panic('vanilla-epoll: TLS cert present at ${cert_path} but key unreadable at ${key_path}: ${err}')
+	}
+	return tls.new_from_pem(cert, key) or {
+		panic('vanilla-epoll: TLS cert/key parse failed: ${err}')
+	}
+}
+
 fn main() {
 	url := os.getenv_opt('DATABASE_URL') or { 'postgres://bench:bench@localhost:5432/benchmark' }
 	cfg := parse_db_url(url)
@@ -1342,6 +1377,62 @@ fn main() {
 		gz:       map[u64][]u8{}
 		gz_mu:    sync.new_rwmutex()
 	}
+
+	// ── json-tls profile: the same /json handler over HTTPS on :8081 ───────────
+	// A SECOND server because tls_config is server-wide. It serves ONLY /json
+	// (404 for everything else) so the TLS port exposes the minimal surface the
+	// profile needs — no /static, /upload, /crud or DB routes. The handler is a
+	// STATELESS request_handler (no make_state, sidestepping the TLS worker's
+	// stateful path) capturing the read-only `ro`; it reuses write_json_into
+	// verbatim, so the bytes are identical to the plaintext /json. Mbed TLS 1.3,
+	// ALPN http/1.1 (set by the tls shim) → curl --http1.1 negotiates 1.1.
+	tls_handler := fn [ro] (req_buffer []u8, fd int, mut out []u8) ! {
+		mut req := request_parser.HttpRequest{
+			buffer: req_buffer
+		}
+		if !request_parser.decode_into(mut req) {
+			wb(mut out, bad_request)
+			return
+		}
+		target := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
+		qpos := target.index_u8(`?`)
+		route := if qpos < 0 { target } else { unsafe { tos(target.str, qpos) } }
+		if route.starts_with('/json/') {
+			count := clamp_count(parse_u_at(route, 6), ro.dataset.len)
+			mut m := qint(req, qk_m)
+			if m == 0 {
+				m = 1
+			}
+			write_json_into(ro, mut out, count, m)
+			return
+		}
+		wb(mut out, not_found)
+	}
+	// Port is fixed to 8081 by the HttpArena harness; TLS_PORT lets local runs pick
+	// a free port (the harness injects nothing, so the default is the contract).
+	mut tls_port := (os.getenv_opt('TLS_PORT') or { '8081' }).int()
+	if tls_port <= 0 {
+		tls_port = 8081
+	}
+	tls_server := http_server.new_server(http_server.ServerConfig{
+		port:            tls_port
+		io_multiplexing: .epoll
+		limits:          http_server.Limits{
+			// json-tls requests are tiny GETs; a small ceiling bounds per-conn
+			// memory and shrinks the DoS surface (the TLS port has no upload path).
+			max_request_bytes: 64 * 1024
+		}
+		request_handler: tls_handler
+		tls_config:      load_tls_config()
+	})!
+	// run() blocks in the accept loop, so the TLS server runs on its own thread
+	// while the plaintext server.run() below blocks main. run() has a value-mut
+	// receiver, so spawn it via a closure with a local mut copy (each Server is
+	// independent — own socket, workers and counters).
+	spawn fn [tls_server] () {
+		mut s := tls_server
+		s.run()
+	}()
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8080
