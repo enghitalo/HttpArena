@@ -2,6 +2,7 @@ module main
 
 import vanilla.http_server
 import vanilla.http_server.http1_1.request_parser
+import vanilla.http_server.static_assets
 import db.pg
 import json
 import os
@@ -47,17 +48,12 @@ struct Fortune {
 	message string
 }
 
-// A static asset preloaded into memory with its full HTTP response.
-struct StaticFile {
-	response []u8
-}
-
 struct Shared {
 mut:
 	db       &pg.DB = unsafe { nil }
 	dataset  []DatasetItem
-	prefixes []string              // per item: `{…,"total":` (everything but the request-dependent total)
-	assets   map[string]StaticFile // /static/<name> -> prebuilt response
+	prefixes []string                  // per item: `{…,"total":` (everything but the request-dependent total)
+	asv      static_assets.AssetServer // /static/* via the audited module (negotiation + queue_buf borrowed send)
 	cache    map[int]string        // crud cache-aside: id -> item JSON
 	cache_mu &sync.RwMutex = unsafe { nil }
 	// json-comp cache: the gzipped response for a given (count, m) is fully
@@ -185,11 +181,14 @@ fn handle(req_buffer []u8, _fd int, mut out []u8, mut sh Shared) ! {
 	} else if route == '/fortunes' {
 		write_resp(mut out, 'text/html; charset=utf-8', sh.fortunes())
 	} else if route.starts_with('/static/') {
-		if f := sh.assets[route[8..]] {
-			out << f.response
-		} else {
-			out << not_found
-		}
+		// Canonical static serving via the lib's static_assets module, mounted at
+		// /static/: negotiates the precompressed .br/.gz sibling per Accept-Encoding
+		// (the arena sends `br;q=1`, so this ships the ~4x smaller .br body instead of
+		// the raw file) and emits small assets via core.queue_buf borrowed send — the
+		// worker sends the preloaded, immutable bytes DIRECTLY (no copy through the
+		// per-connection write buffer). ONE audited path shared with vanilla-epoll,
+		// replacing the hand-rolled identity-only map that ignored Accept-Encoding.
+		sh.asv.respond_into(req_buffer, mut out) or { out << not_found }
 	} else if route == '/crud/items' {
 		if method == 'POST' {
 			sh.write_crud_create(mut out, req)
@@ -668,20 +667,6 @@ fn accepts_gzip(req request_parser.HttpRequest) bool {
 }
 
 // content_type maps a file extension to a MIME type for the static handler.
-fn content_type(name string) string {
-	ext := name.all_after_last('.')
-	return match ext {
-		'css' { 'text/css' }
-		'js' { 'application/javascript' }
-		'json' { 'application/json' }
-		'html' { 'text/html' }
-		'svg' { 'image/svg+xml' }
-		'webp' { 'image/webp' }
-		'woff2' { 'font/woff2' }
-		else { 'application/octet-stream' }
-	}
-}
-
 // parse_db_url turns postgres://user:pass@host:port/dbname into a pg.Config.
 fn parse_db_url(u string) pg.Config {
 	mut s := u
@@ -733,25 +718,23 @@ fn main() {
 		prefixes << enc#[..-1] + ',"total":'
 	}
 
-	// Preload static assets into memory as ready-to-send responses (originals
-	// only; skip the precompressed .gz/.br siblings — we serve identity).
-	mut assets := map[string]StaticFile{}
 	static_dir := os.getenv_opt('STATIC_DIR') or { '/data/static' }
-	for name in os.ls(static_dir) or { []string{} } {
-		if name.ends_with('.gz') || name.ends_with('.br') {
-			continue
-		}
-		bytes := os.read_bytes('${static_dir}/${name}') or { continue }
-		assets[name] = StaticFile{
-			response: static_response(content_type(name), bytes)
-		}
-	}
+	// Canonical static server: loads every asset PLUS its .br/.gz siblings once,
+	// mounts them at /static/, and negotiates Accept-Encoding per request (serving
+	// the precompressed body when accepted, emitted via core.queue_buf borrowed
+	// send). Replaces the former identity-only map that ignored Accept-Encoding and
+	// always shipped the raw file. spa_fallback off: the arena set has no SPA.
+	asv := static_assets.new(static_assets.Config{
+		root:         static_dir
+		url_prefix:   '/static/'
+		spa_fallback: ''
+	}) or { panic('vanilla-io_uring: static_assets init failed: ${err}') }
 
 	mut sh := Shared{
 		db:       db
 		dataset:  dataset
 		prefixes: prefixes
-		assets:   assets
+		asv:      asv
 		cache:    map[int]string{}
 		cache_mu: sync.new_rwmutex()
 		gz_cache: map[u64][]u8{}
@@ -772,13 +755,3 @@ fn main() {
 }
 
 // static_response prebuilds the full HTTP response for a static file.
-fn static_response(ctype string, body []u8) []u8 {
-	mut sb := strings.new_builder(body.len + 96)
-	sb.write_string('HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Type: ')
-	sb.write_string(ctype)
-	sb.write_string('\r\nContent-Length: ')
-	sb.write_decimal(i64(body.len))
-	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	unsafe { sb.write_ptr(body.data, body.len) }
-	return sb
-}

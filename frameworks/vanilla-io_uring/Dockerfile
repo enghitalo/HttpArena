@@ -24,13 +24,16 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 # main moved, but that hit api.github.com every build and a transient 504/rate-limit
 # failed the whole build (MDA2AV/HttpArena#895). Bump this commit to pick up lib fixes.
 #
-# vanilla main @15bd57e picks up the allocation fixes from a lib-wide audit:
-# enghitalo/vanilla#72 (pg_async: read wire ints at offset, drop per-read slices),
-# #73 (static_assets: zero-copy conditional-GET/Range parsing) and #74 (TLS: pool the
-# per-connection read/response buffers). pg_async#72 is the one that touches this
-# backend's async-DB row-decode hot path.
+# vanilla bumped to main + the static_assets static path (enghitalo/vanilla#80
+# url_prefix mount, #81 core.queue_buf borrowed send for small assets): this entry
+# now serves /static/* through the audited static_assets module — precompressed
+# .br/.gz negotiation per Accept-Encoding + ETag/Vary, with small assets emitted via
+# core.queue_buf borrowed send (the #75 mechanism, now folded into the module) so the
+# preloaded bytes are sent directly, never copied through the per-connection write
+# buffer. Replaces the hand-rolled identity-only map. Also includes #79 (kTLS, inert
+# here: built without -d vanilla_tls).
 RUN git clone https://github.com/enghitalo/vanilla /root/.vmodules/vanilla && \
-    git -C /root/.vmodules/vanilla checkout 15bd57e5ae8cf1383bd386826e48e08a10f6d4b4
+    git -C /root/.vmodules/vanilla checkout 4e2267058395222b080801a1f89191fbfa9395c3
 
 WORKDIR /app
 COPY . .
