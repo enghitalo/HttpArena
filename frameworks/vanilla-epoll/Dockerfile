@@ -22,14 +22,14 @@ RUN git clone https://github.com/vlang/v /opt/v && \
 # (or rate-limit) failed the whole build (MDA2AV/HttpArena#895). To pick up upstream
 # library fixes, bump this commit.
 #
-# vanilla bumped to main + enghitalo/vanilla#80 (static_assets `url_prefix`): this
-# entry now serves /static/* through the audited static_assets module (precompressed
-# .br/.gz negotiation per Accept-Encoding + ETag/Vary + sendfile) instead of a second,
-# hand-rolled identity-only map that ignored Accept-Encoding. The bump also catches up
-# to current vanilla main (#75 core.queue_buf, #79 kTLS record offload) — both inert
-# in this image (built without -d vanilla_tls; queue_buf is unused by the epoll entry).
+# vanilla main @b189036 (incl. enghitalo/vanilla#80 static_assets `url_prefix` and
+# #81 core.queue_buf borrowed send): this entry serves /static/* through the audited
+# static_assets module (precompressed .br/.gz negotiation per Accept-Encoding +
+# ETag/Vary + sendfile) instead of a second, hand-rolled identity-only map that
+# ignored Accept-Encoding. #81's borrowed send and #79 kTLS are inert here (built
+# without -d vanilla_tls; epoll serves small bodies via the write buffer).
 RUN git clone https://github.com/enghitalo/vanilla /root/.vmodules/vanilla && \
-    git -C /root/.vmodules/vanilla checkout f59a534045e5731a6c03f16ea23f19cbfe2e7334
+    git -C /root/.vmodules/vanilla checkout b189036212e4283ef2cffe42b318b556f8a3d1bc
 
 WORKDIR /app
 COPY . .
