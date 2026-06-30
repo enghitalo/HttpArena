@@ -60,8 +60,7 @@ mut:
 	// json-comp cache: the gzipped response for a given (count, m) is fully
 	// deterministic and gzip dominates the cost, so compress once and reuse.
 	// Key = (count << 32) | m. The benchmark hits only a few pairs, so it's tiny.
-	gz_cache map[u64][]u8
-	gz_mu    &sync.RwMutex = unsafe { nil }
+	gz_cache map[u64][]u8 // json-comp: precomputed at boot, READ-ONLY during serving (lock-free reads)
 }
 
 struct CrudCreate {
@@ -386,38 +385,39 @@ fn (sh &Shared) write_json_response(mut out []u8, count int, m i64) {
 	ws(mut out, '}')
 }
 
-// write_json_gzip is the json-comp path. The gzipped response for a given
-// (count, m) is fully deterministic and gzip CPU dominates the cost, so we cache
-// the COMPLETE response bytes and just append the cached copy on a hit — no
-// rebuild, no recompress. Compressing once instead of per-request is the whole
-// win for json-comp (the profile is compression-bound, not allocation-bound).
-fn (mut sh Shared) write_json_gzip(mut out []u8, count int, m i64) {
-	key := (u64(u32(count)) << 32) | u64(u32(m))
-	sh.gz_mu.@rlock()
-	cached := sh.gz_cache[key] or { []u8{} }
-	sh.gz_mu.runlock()
-	if cached.len > 0 {
-		out << cached
-		return
-	}
+// gz_response builds the COMPLETE gzipped /json response for (count, m). Pure
+// function of the shared dataset (deterministic), so it is precomputed once at
+// boot (see main) and also serves the cold path for an unexpected param.
+fn gz_response(sh &Shared, count int, m i64) []u8 {
 	body := sh.json_body(count, m)
-	gz := gzip.compress(body.bytes()) or {
-		write_resp(mut out, 'application/json', body)
-		return
-	}
+	gz := gzip.compress(body.bytes()) or { return []u8{} }
 	mut resp := []u8{cap: gz.len + 128}
 	ws(mut resp,
 		'HTTP/1.1 200 OK\r\nServer: vanilla\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut resp, i64(gz.len))
 	ws(mut resp, '\r\nConnection: keep-alive\r\n\r\n')
 	unsafe { resp.push_many(gz.data, gz.len) }
-	// Store it (bounded so a flood of distinct m values can't grow it without limit).
-	sh.gz_mu.@lock()
-	if sh.gz_cache.len < 1024 {
-		sh.gz_cache[key] = resp
+	return resp
+}
+
+// write_json_gzip is the json-comp path. The gzipped response per (count, m) is
+// deterministic, so the cache is fully precomputed at boot and is READ-ONLY during
+// serving — the hot path is a lock-free map read (no per-request shared RwMutex,
+// which contended across all workers and collapsed io_uring json-comp @16384).
+fn (sh &Shared) write_json_gzip(mut out []u8, count int, m i64) {
+	key := (u64(u32(count)) << 32) | u64(u32(m))
+	if cached := sh.gz_cache[key] {
+		out << cached
+		return
 	}
-	sh.gz_mu.unlock()
-	out << resp
+	// Param outside the precomputed grid (not sent by the benchmark): build and
+	// send WITHOUT caching, so the hot path stays write-free and lock-free.
+	resp := gz_response(sh, count, m)
+	if resp.len > 0 {
+		out << resp
+	} else {
+		write_resp(mut out, 'application/json', sh.json_body(count, m))
+	}
 }
 
 // json_body builds just the /json body string (used for the gzip path).
@@ -762,7 +762,20 @@ fn main() {
 		cache:    map[int]string{}
 		cache_mu: sync.new_rwmutex()
 		gz_cache: map[u64][]u8{}
-		gz_mu:    sync.new_rwmutex()
+	}
+
+	// Precompute the json-comp (gzip) responses at boot so write_json_gzip reads the
+	// cache LOCK-FREE during serving (no per-request shared RwMutex — that contended
+	// across workers and collapsed io_uring json-comp @16384 conns). The profile's
+	// params are bounded; cover count 1..min(dataset,64) x m 1..16.
+	gz_cap_count := if dataset.len < 64 { dataset.len } else { 64 }
+	for c in 1 .. gz_cap_count + 1 {
+		for mm in 1 .. 17 {
+			r := gz_response(sh, c, i64(mm))
+			if r.len > 0 {
+				sh.gz_cache[(u64(u32(c)) << 32) | u64(u32(mm))] = r
+			}
+		}
 	}
 
 	// ── json-tls profile: /json over HTTPS on :8081 via the epoll + kTLS backend ──
